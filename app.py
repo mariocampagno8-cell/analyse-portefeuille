@@ -540,7 +540,7 @@ with onglets[4]:
     s = st.columns(3)
     horizon = s[0].slider("Horizon (périodes)", 21, 1260, 252, step=21)
     taille_bloc = s[1].slider("Taille des blocs", 1, 40, 10)
-    tirages = s[2].select_slider("Tirages", [1000, 2000, 5000, 10000], value=4000)
+    tirages = s[2].select_slider("Tirages", [1000, 2000, 5000, 10000], value=5000)
 
     final = opt.bootstrap_horizon(rdt_ptf, horizon, tirages, taille_bloc)
 
