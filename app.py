@@ -111,6 +111,18 @@ def enregistrer_portefeuille(df: pd.DataFrame) -> None:
     )
 
 
+def sans_doublons(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Supprime les colonnes homonymes avant affichage.
+
+    Streamlit passe par Arrow, qui refuse les noms de colonnes dupliqués.
+    Les sources externes en produisent parfois sans prévenir.
+    """
+    if isinstance(df, pd.DataFrame) and df.columns.duplicated().any():
+        return df.loc[:, ~df.columns.duplicated()]
+    return df
+
+
 def fmt(valeur, decimales=2, suffixe=""):
     if valeur is None or (isinstance(valeur, float) and not np.isfinite(valeur)):
         return "—"
@@ -1086,11 +1098,11 @@ with onglets[10]:
 
         st.divider()
         st.markdown(f"**Compte de résultat** (en {unite.lower()})")
-        st.dataframe((cr / diviseur).round(2), use_container_width=True)
+        st.dataframe(sans_doublons(cr / diviseur).round(2), use_container_width=True)
 
         st.markdown("**Évolution des marges**")
         if not mg.empty:
-            st.line_chart(mg.T.sort_index(), height=280)
+            st.line_chart(sans_doublons(mg.T).sort_index(), height=280)
             st.caption(
                 "Des marges qui s'érodent pendant que le chiffre d'affaires "
                 "progresse signalent une croissance achetée par les prix."
@@ -1099,7 +1111,7 @@ with onglets[10]:
         flux = fo.flux_tresorerie(cash)
         if not flux.empty:
             st.markdown(f"**Flux de trésorerie** (en {unite.lower()})")
-            st.dataframe((flux / diviseur).round(2), use_container_width=True)
+            st.dataframe(sans_doublons(flux / diviseur).round(2), use_container_width=True)
             st.caption(
                 "Le flux libre est le poste le plus difficile à habiller "
                 "comptablement. Quand il diverge durablement du résultat net, "
@@ -1245,7 +1257,7 @@ with onglets[11]:
         if est.empty:
             st.caption("Estimations indisponibles pour cette valeur.")
         else:
-            st.dataframe(est.round(3), use_container_width=True)
+            st.dataframe(sans_doublons(est).round(3), use_container_width=True)
             st.caption(
                 "Les périodes sont codées par Yahoo : 0q le trimestre en cours, "
                 "+1q le suivant, 0y l'exercice en cours, +1y le suivant."
@@ -1256,7 +1268,7 @@ with onglets[11]:
         if rev.empty:
             st.caption("Historique de révision indisponible.")
         else:
-            st.dataframe(rev.round(3), use_container_width=True)
+            st.dataframe(sans_doublons(rev).round(3), use_container_width=True)
             st.caption(
                 "Le momentum des révisions est le signal le plus exploitable de "
                 "cette page : des estimations relevées de façon continue sont "
@@ -1266,7 +1278,7 @@ with onglets[11]:
 
         sens = pv.sens_des_revisions(d.get("eps_revisions"))
         if not sens.empty:
-            st.dataframe(sens, use_container_width=True)
+            st.dataframe(sans_doublons(sens), use_container_width=True)
 
         st.divider()
 
@@ -1291,7 +1303,7 @@ with onglets[11]:
 
         surp = pv.surprises(d.get("dates"))
         if not surp.empty:
-            st.dataframe(surp.round(3), use_container_width=True, height=280)
+            st.dataframe(sans_doublons(surp).round(3), use_container_width=True, height=280)
             st.caption(
                 "Une série ininterrompue de surprises positives traduit soit une "
                 "exécution solide, soit une direction qui guide prudemment les "
@@ -1316,12 +1328,12 @@ with onglets[11]:
             affichage = trim.copy()
             monetaires = [i for i in affichage.index if "%" not in i and "BPA" not in i]
             affichage.loc[monetaires] = affichage.loc[monetaires] / div_pv
-            st.dataframe(affichage.round(2), use_container_width=True)
+            st.dataframe(sans_doublons(affichage).round(2), use_container_width=True)
 
             croiss = pv.croissance_annuelle_glissante(d.get("q_income"))
             if not croiss.empty:
                 st.markdown("**Croissance face au même trimestre un an plus tôt (%)**")
-                st.dataframe(croiss.round(1), use_container_width=True)
+                st.dataframe(sans_doublons(croiss).round(1), use_container_width=True)
                 st.caption(
                     "Seule comparaison valable pour une activité saisonnière : "
                     "un quatrième trimestre se compare au quatrième trimestre "

@@ -235,22 +235,27 @@ def note_moyenne(info: dict) -> dict:
 def estimations(estimation_ca: pd.DataFrame,
                 estimation_bpa: pd.DataFrame) -> pd.DataFrame:
     """Prévisions de chiffre d'affaires et de bénéfice par période."""
+    libelles = {"avg": "moyen", "low": "bas", "high": "haut",
+                "numberOfAnalysts": "analystes", "growth": "croissance",
+                "yearAgoRevenue": "an dernier", "yearAgoEps": "an dernier"}
+
     blocs = []
     for source, prefixe in [(estimation_ca, "CA"), (estimation_bpa, "BPA")]:
-        if source is None or source.empty:
+        if source is None or getattr(source, "empty", True):
             continue
         df = source.copy()
-        renommage = {"avg": f"{prefixe} moyen", "low": f"{prefixe} bas",
-                     "high": f"{prefixe} haut",
-                     "numberOfAnalysts": f"{prefixe} — analystes",
-                     "growth": f"{prefixe} — croissance",
-                     "yearAgoRevenue": "CA an dernier",
-                     "yearAgoEps": "BPA an dernier"}
-        df = df.rename(columns={k: v for k, v in renommage.items() if k in df.columns})
+        # Prefixer TOUTES les colonnes, y compris celles non prevues : yfinance
+        # fait evoluer ses champs, et deux colonnes homonymes font echouer
+        # l'affichage.
+        df.columns = [f"{prefixe} — {libelles.get(str(c), str(c))}"
+                      for c in df.columns]
         blocs.append(df)
+
     if not blocs:
         return pd.DataFrame()
-    return pd.concat(blocs, axis=1)
+
+    fusion = pd.concat(blocs, axis=1)
+    return fusion.loc[:, ~fusion.columns.duplicated()]
 
 
 def revisions(eps_trend: pd.DataFrame) -> pd.DataFrame:
