@@ -18,6 +18,7 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+import acces as ac
 import analytics as an
 import feuille as fe
 import fondamentaux as fo
@@ -29,6 +30,10 @@ import qualite as ql
 import univers as univ
 
 st.set_page_config(page_title="Portefeuille", page_icon="📊", layout="wide")
+
+# Porte d'entrée : rien ne s'affiche tant que l'identification n'a pas réussi.
+# Désactivable en supprimant ces deux lignes si l'application reste privée.
+ac.porte("Analyse de portefeuille")
 
 FICHIER_PORTEFEUILLE = Path(__file__).parent / "portefeuille.json"
 
@@ -133,6 +138,7 @@ def fmt(valeur, decimales=2, suffixe=""):
 # Panneau lateral
 # --------------------------------------------------------------------------
 
+ac.bouton_deconnexion()
 st.sidebar.header("Paramètres")
 
 indices = univ.INDICES
@@ -319,12 +325,14 @@ with onglets[0]:
             "PRU": pru,
             "Valeur": dernier * float(ligne["Quantité"]) * fx,
             "Investi": pru * float(ligne["Quantité"]) * fx,
+            "Taux de change": fx,
         })
 
     val = pd.DataFrame(valorisation).set_index("Ticker")
     val = val.groupby(level=0).agg({
         "Quantité": "sum", "Devise": "first", "Cours": "last",
         "PRU": "mean", "Valeur": "sum", "Investi": "sum",
+        "Taux de change": "last",
     })
     val["Plus-value"] = val["Valeur"] - val["Investi"]
     val["Performance (%)"] = np.where(
@@ -358,11 +366,36 @@ with onglets[0]:
     gauche, droite = st.columns([3, 2])
     with gauche:
         st.subheader("Lignes")
-        st.dataframe(
-            val[["Quantité", "Devise", "Cours", "PRU", "Valeur",
-                 "Plus-value", "Performance (%)", "Poids (%)"]].round(2),
-            use_container_width=True,
-        )
+        affichage_lignes = val[[
+            "Quantité", "Devise", "Cours", "PRU", "Investi", "Valeur",
+            "Plus-value", "Performance (%)", "Poids (%)",
+        ]].rename(columns={
+            "Cours": "Cours (devise cotation)",
+            "PRU": "PRU (devise cotation)",
+            "Investi": f"Investi ({devise_base})",
+            "Valeur": f"Valeur ({devise_base})",
+            "Plus-value": f"Plus-value ({devise_base})",
+        })
+        st.dataframe(affichage_lignes.round(2), use_container_width=True)
+
+        devises_etrangeres = val[val["Devise"] != devise_base]
+        if not devises_etrangeres.empty:
+            st.caption(
+                f"Cours et PRU sont exprimés dans la devise de cotation de "
+                f"chaque valeur ; les montants sont convertis en {devise_base}. "
+                "Un calcul de tête sur les deux premières colonnes ne "
+                "retrouvera donc pas la plus-value affichée. Taux appliqués : "
+                + ", ".join(
+                    f"1 {d} = {t:.4f} {devise_base}"
+                    for d, t in devises_etrangeres.groupby("Devise")
+                    ["Taux de change"].last().items())
+                + "."
+            )
+            st.caption(
+                "Conséquence à garder en tête : sur une valeur en dollars, une "
+                "partie de ta performance vient du change et non de l'action "
+                "elle-même."
+            )
     with droite:
         st.subheader("Répartition")
         fig = px.pie(val.reset_index(), names="Ticker", values="Valeur", hole=0.55)
