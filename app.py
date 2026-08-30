@@ -21,7 +21,10 @@ from plotly.subplots import make_subplots
 import analytics as an
 import fondamentaux as fo
 import indicateurs as ind
+import macro as mc
 import optimisation as opt
+import previsions as pv
+import qualite as ql
 import univers as univ
 
 st.set_page_config(page_title="Portefeuille", page_icon="📊", layout="wide")
@@ -160,7 +163,8 @@ if "portefeuille" not in st.session_state:
 onglets = st.tabs([
     "Portefeuille", "Risque et bêta", "Corrélations", "Optimisation",
     "Simulation et stress", "Backtest", "Analyse d'une valeur", "Données",
-    "Screener", "Indicateurs", "Fondamentaux",
+    "Screener", "Indicateurs", "Fondamentaux", "Résultats et consensus",
+    "Macro et calendrier", "Qualité des données",
 ])
 
 
@@ -540,7 +544,7 @@ with onglets[4]:
     s = st.columns(3)
     horizon = s[0].slider("Horizon (périodes)", 21, 1260, 252, step=21)
     taille_bloc = s[1].slider("Taille des blocs", 1, 40, 10)
-    tirages = s[2].select_slider("Tirages", [1000, 2000, 5000, 10000], value=5000)
+    tirages = s[2].select_slider("Tirages", [1000, 2000, 5000, 10000], value=4000)
 
     final = opt.bootstrap_horizon(rdt_ptf, horizon, tirages, taille_bloc)
 
@@ -1077,3 +1081,574 @@ with onglets[10]:
             "peuvent comporter des erreurs — vérifie sur le rapport annuel "
             "avant toute décision engageante."
         )
+
+
+with onglets[11]:
+    st.subheader("Résultats, consensus et actualités")
+
+    ticker_pv = st.text_input(
+        "Ticker", value=list(val.index)[0] if len(val.index) else "AAPL",
+        key="ticker_previsions",
+    ).strip().upper()
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def charger_consensus(ticker: str):
+        """Trimestriels, estimations, avis et actualités. Cache 1 h."""
+        blocs = {}
+        try:
+            t = yf.Ticker(ticker)
+            for cle, acces in [
+                ("q_income", lambda: t.quarterly_income_stmt),
+                ("dates", lambda: t.earnings_dates),
+                ("info", lambda: dict(t.info)),
+                ("reco", lambda: t.recommendations),
+                ("upgrades", lambda: t.upgrades_downgrades),
+                ("eps_trend", lambda: t.eps_trend),
+                ("eps_revisions", lambda: t.eps_revisions),
+                ("est_ca", lambda: t.revenue_estimate),
+                ("est_bpa", lambda: t.earnings_estimate),
+                ("news", lambda: t.news),
+            ]:
+                try:
+                    blocs[cle] = acces()
+                except Exception:
+                    blocs[cle] = pd.DataFrame() if cle != "info" else {}
+        except Exception:
+            pass
+        return blocs
+
+    with st.spinner("Chargement des données de consensus…"):
+        d = charger_consensus(ticker_pv)
+
+    info_pv = d.get("info", {}) or {}
+    if not info_pv:
+        st.error(f"Aucune donnée pour {ticker_pv}.")
+    else:
+        st.caption(info_pv.get("longName", ticker_pv))
+
+        # --- Consensus d'objectif de cours -------------------------------
+        st.markdown("**Consensus des analystes**")
+        obj = pv.objectif_de_cours(info_pv)
+        note = pv.note_moyenne(info_pv)
+
+        c = st.columns(5)
+        c[0].metric("Cours actuel", fmt(obj.get("Cours actuel")))
+        c[1].metric("Objectif moyen", fmt(obj.get("Objectif moyen")),
+                    f"{obj.get('Potentiel implicite (%)', float('nan')):+.1f} %"
+                    if np.isfinite(obj.get("Potentiel implicite (%)", np.nan)) else None)
+        c[2].metric("Fourchette",
+                    f"{fmt(obj.get('Objectif bas'), 0)} – {fmt(obj.get('Objectif haut'), 0)}")
+        c[3].metric("Avis moyen", note.get("avis", "—"),
+                    f"note {fmt(note.get('note'), 2)}")
+        c[4].metric("Analystes", obj.get("Nombre d'analystes") or "—")
+
+        st.caption(
+            "Le consensus est structurellement optimiste : les objectifs moyens "
+            "dépassent le cours dans la grande majorité des cas et les "
+            "recommandations de vente sont rares. Ce qui porte l'information, "
+            "c'est la révision du consensus, pas son niveau."
+        )
+
+        avis = pv.distribution_avis(d.get("reco"))
+        if not avis.empty:
+            st.markdown("**Répartition des recommandations**")
+            fig = go.Figure()
+            couleurs = {"Achat fort": "#1D9E75", "Achat": "#639922",
+                        "Conserver": "#EF9F27", "Vendre": "#D85A30",
+                        "Vente forte": "#E24B4A"}
+            for colonne in avis.columns:
+                fig.add_bar(x=avis.index, y=avis[colonne], name=colonne,
+                            marker_color=couleurs.get(colonne))
+            fig.update_layout(barmode="stack", height=260,
+                              margin=dict(l=0, r=0, t=10, b=0),
+                              legend=dict(orientation="h", y=1.15),
+                              xaxis_title="Mois écoulés")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        # --- Estimations et révisions -------------------------------------
+        st.markdown("**Estimations de chiffre d'affaires et de bénéfice**")
+        est = pv.estimations(d.get("est_ca"), d.get("est_bpa"))
+        if est.empty:
+            st.caption("Estimations indisponibles pour cette valeur.")
+        else:
+            st.dataframe(est.round(3), use_container_width=True)
+            st.caption(
+                "Les périodes sont codées par Yahoo : 0q le trimestre en cours, "
+                "+1q le suivant, 0y l'exercice en cours, +1y le suivant."
+            )
+
+        st.markdown("**Révision des estimations de bénéfice**")
+        rev = pv.revisions(d.get("eps_trend"))
+        if rev.empty:
+            st.caption("Historique de révision indisponible.")
+        else:
+            st.dataframe(rev.round(3), use_container_width=True)
+            st.caption(
+                "Le momentum des révisions est le signal le plus exploitable de "
+                "cette page : des estimations relevées de façon continue sont "
+                "documentées comme prédictives, contrairement au niveau du "
+                "consensus."
+            )
+
+        sens = pv.sens_des_revisions(d.get("eps_revisions"))
+        if not sens.empty:
+            st.dataframe(sens, use_container_width=True)
+
+        st.divider()
+
+        # --- Publications et surprises ------------------------------------
+        st.markdown("**Historique des publications**")
+        prochaine = pv.prochaine_publication(d.get("dates"))
+        if prochaine:
+            p1, p2 = st.columns(2)
+            p1.metric("Prochaine publication",
+                      prochaine["date"].strftime("%d/%m/%Y")
+                      if hasattr(prochaine["date"], "strftime") else str(prochaine["date"]))
+            p2.metric("BPA attendu", fmt(prochaine.get("bpa_attendu")))
+
+        reussite = pv.taux_de_reussite(d.get("dates"))
+        if reussite:
+            r = st.columns(3)
+            r[0].metric("Au-dessus du consensus",
+                        fmt(reussite["au-dessus du consensus (%)"], 0, " %"),
+                        f"sur {reussite['publications analysées']} publications")
+            r[1].metric("Surprise moyenne", fmt(reussite["surprise moyenne (%)"], 2, " %"))
+            r[2].metric("Surprise médiane", fmt(reussite["surprise médiane (%)"], 2, " %"))
+
+        surp = pv.surprises(d.get("dates"))
+        if not surp.empty:
+            st.dataframe(surp.round(3), use_container_width=True, height=280)
+            st.caption(
+                "Une série ininterrompue de surprises positives traduit soit une "
+                "exécution solide, soit une direction qui guide prudemment les "
+                "analystes pour être sûre de les dépasser."
+            )
+
+        st.divider()
+
+        # --- Trimestriels --------------------------------------------------
+        st.markdown("**Comptes trimestriels**")
+        unite_pv = st.selectbox("Unité", ["Millions", "Milliards", "Brut"],
+                                key="unite_previsions")
+        div_pv = {"Millions": 1e6, "Milliards": 1e9, "Brut": 1.0}[unite_pv]
+
+        trim = pv.resultats_trimestriels(d.get("q_income"))
+        if trim.empty:
+            st.caption(
+                "Comptes trimestriels indisponibles. Beaucoup de sociétés "
+                "européennes ne publient qu'au semestre."
+            )
+        else:
+            affichage = trim.copy()
+            monetaires = [i for i in affichage.index if "%" not in i and "BPA" not in i]
+            affichage.loc[monetaires] = affichage.loc[monetaires] / div_pv
+            st.dataframe(affichage.round(2), use_container_width=True)
+
+            croiss = pv.croissance_annuelle_glissante(d.get("q_income"))
+            if not croiss.empty:
+                st.markdown("**Croissance face au même trimestre un an plus tôt (%)**")
+                st.dataframe(croiss.round(1), use_container_width=True)
+                st.caption(
+                    "Seule comparaison valable pour une activité saisonnière : "
+                    "un quatrième trimestre se compare au quatrième trimestre "
+                    "précédent, jamais au troisième."
+                )
+
+        st.divider()
+
+        # --- Changements d'avis --------------------------------------------
+        st.markdown("**Relèvements et abaissements**")
+        solde = pv.solde_des_avis(d.get("upgrades"), 90)
+        if solde:
+            sc = st.columns(3)
+            sc[0].metric("Relèvements (90 j)", solde["relèvements"])
+            sc[1].metric("Abaissements (90 j)", solde["abaissements"])
+            sc[2].metric("Solde", f"{solde['solde']:+d}")
+
+        grandes = st.checkbox("Grandes maisons uniquement", value=False,
+                              help="Goldman Sachs, Morgan Stanley, JP Morgan, "
+                                   "UBS, Barclays, Bank of America et assimilées.")
+        chgt = pv.changements_davis(d.get("upgrades"), 30, grandes)
+        if chgt.empty:
+            st.caption("Aucun changement d'avis disponible.")
+        else:
+            st.dataframe(chgt, use_container_width=True, height=320)
+            st.caption(
+                "L'objectif de cours individuel et courant de chaque maison "
+                "n'est pas diffusé gratuitement — seuls Bloomberg et FactSet le "
+                "fournissent. Ces changements d'avis nominatifs en sont "
+                "l'équivalent le plus proche, et ce sont eux qui déplacent "
+                "réellement les cours le jour de leur publication."
+            )
+
+        st.divider()
+
+        # --- Actualités ------------------------------------------------------
+        st.markdown("**Actualités**")
+        actus = pv.actualites(d.get("news"), 15)
+        if actus.empty:
+            st.caption("Aucune actualité disponible.")
+        else:
+            st.dataframe(
+                actus, use_container_width=True, hide_index=True, height=420,
+                column_config={"Lien": st.column_config.LinkColumn(
+                    "Lien", display_text="Ouvrir")},
+            )
+            st.caption(
+                "À lire comme un contexte, jamais comme un signal : au moment "
+                "où une information est publique, elle est déjà dans les cours."
+            )
+
+
+with onglets[12]:
+    st.subheader("Contexte macroéconomique et calendrier")
+
+    sous = st.tabs(["Calendrier", "Indicateurs macro", "Courbe des taux", "Marchés"])
+
+    # ----------------------------------------------------------------------
+    with sous[0]:
+        st.markdown("**Publications de tes valeurs**")
+
+        @st.cache_data(ttl=21600, show_spinner=False)
+        def dates_publications(tickers: tuple[str, ...]) -> dict:
+            """Dates de publication à venir. Cache 6 h."""
+            out = {}
+            for t in tickers:
+                try:
+                    out[t] = yf.Ticker(t).earnings_dates
+                except Exception:
+                    out[t] = pd.DataFrame()
+            return out
+
+        with st.spinner("Recherche des prochaines publications…"):
+            cal_res = mc.calendrier_resultats(dates_publications(tuple(val.index)))
+
+        if cal_res.empty:
+            st.caption(
+                "Aucune date de publication annoncée pour tes lignes. C'est "
+                "fréquent hors des États-Unis, où les calendriers sont publiés "
+                "plus tardivement."
+            )
+        else:
+            imminent = cal_res[cal_res["Dans (jours)"] <= 14]
+            if not imminent.empty:
+                st.warning(
+                    f"{len(imminent)} publication(s) dans les 14 jours : "
+                    + ", ".join(imminent["Ticker"])
+                )
+            st.dataframe(
+                cal_res.assign(Date=cal_res["Date"].dt.strftime("%d/%m/%Y")),
+                use_container_width=True, hide_index=True,
+            )
+            st.caption(
+                "Les jours de publication concentrent une part importante de la "
+                "volatilité annuelle d'un titre. Le sens du mouvement dépend de "
+                "l'écart aux attentes, pas de la qualité absolue des chiffres."
+            )
+
+        st.divider()
+        st.markdown("**Calendrier macroéconomique**")
+
+        m1, m2 = st.columns([1, 2])
+        horizon = m1.slider("Horizon (mois)", 1, 6, 2)
+        zones = m2.multiselect("Zones", ["États-Unis", "Zone euro", "Mondial"],
+                               default=["États-Unis", "Zone euro", "Mondial"])
+
+        cal_macro = mc.calendrier_macro(mois_a_venir=horizon)
+        if zones:
+            cal_macro = cal_macro[cal_macro["Zone"].isin(zones)]
+
+        st.info(
+            "Dates reconstituées à partir des schémas habituels de publication "
+            "— premier vendredi pour l'emploi, premier jour ouvré pour l'ISM, "
+            "et ainsi de suite. Elles sont justes à un jour près. Vérifie sur "
+            "les sites officiels avant toute décision liée à une échéance."
+        )
+
+        for semaine, evenements in mc.regrouper_par_semaine(cal_macro).items():
+            with st.expander(f"{semaine} — {len(evenements)} événement(s)",
+                             expanded=(list(mc.regrouper_par_semaine(cal_macro)).index(semaine) == 0)):
+                for _, e in evenements.iterrows():
+                    icone = {"Banque centrale": "🏛", "Statistique": "📊",
+                             "Marché": "📈"}.get(e["Type"], "•")
+                    st.markdown(
+                        f"{icone} **{e['Date'].strftime('%A %d/%m')} · {e['Heure']}** — "
+                        f"{e['Événement']} ({e['Zone']})"
+                    )
+                    st.caption(e["Commentaire"])
+
+        with st.expander("Calendriers officiels"):
+            for nom, lien in mc.LIENS_OFFICIELS.items():
+                st.markdown(f"- [{nom}]({lien})")
+
+    # ----------------------------------------------------------------------
+    with sous[1]:
+        st.caption(
+            "Séries publiques de la Réserve fédérale de Saint-Louis (FRED). "
+            "Les variations sont en points de pourcentage pour les taux et en "
+            "pourcentage pour les niveaux."
+        )
+
+        @st.cache_data(ttl=21600, show_spinner=False)
+        def charger_macro(codes: tuple[str, ...]) -> dict:
+            return {c: mc.charger_serie(c) for c in codes}
+
+        familles = sorted({f for _, f in mc.SERIES.values()})
+        choix_familles = st.multiselect(
+            "Familles", familles,
+            default=["Taux", "Inflation", "Activité"])
+
+        codes = tuple(c for c, (_, f) in mc.SERIES.items() if f in choix_familles)
+        if not codes:
+            st.info("Choisis au moins une famille.")
+        else:
+            with st.spinner("Téléchargement des séries FRED…"):
+                series_macro = charger_macro(codes)
+
+            tb = mc.tableau_de_bord(series_macro)
+            if tb.empty:
+                st.error("Séries indisponibles. FRED est peut-être inaccessible.")
+            else:
+                st.dataframe(tb.round(2), use_container_width=True, height=440)
+
+                st.markdown("**Évolution d'une série**")
+                dispo = {mc.SERIES[c][0]: c for c in codes
+                         if not series_macro[c].empty}
+                choix_serie = st.selectbox("Série", list(dispo))
+                serie = series_macro[dispo[choix_serie]]
+
+                en_glissement = st.checkbox(
+                    "Afficher en glissement annuel", value=False,
+                    help="Indispensable pour les indices de prix : l'indice brut "
+                         "ne dit rien, seule sa variation sur douze mois est "
+                         "l'inflation.")
+                st.line_chart(
+                    mc.variation_annuelle(serie) if en_glissement else serie,
+                    height=340)
+
+    # ----------------------------------------------------------------------
+    with sous[2]:
+        with st.spinner("Chargement de la courbe des taux…"):
+            series_courbe = charger_macro(tuple(mc.COURBE) + ("T10Y2Y",))
+
+        courbe = mc.courbe_des_taux(series_courbe)
+        diag = mc.diagnostic_courbe(series_courbe)
+
+        if diag:
+            dc = st.columns(3)
+            dc[0].metric("Écart 10 ans − 2 ans",
+                         fmt(diag["écart 10-2 ans"], 2, " pts"), diag["état"])
+            dc[1].metric("Lecture", diag["lecture"])
+            dc[2].metric("Dernière donnée", str(diag["date"]))
+
+        if courbe.empty:
+            st.error("Courbe indisponible.")
+        else:
+            fig = px.line(courbe, x="Maturité (années)", y="Taux (%)",
+                          markers=True, text="Échéance")
+            fig.update_traces(textposition="top center", line_color="#7F77DD")
+            fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.caption(
+                "Une courbe inversée — le court terme au-dessus du long terme — "
+                "a précédé chacune des récessions américaines depuis 1955, avec "
+                "un délai de six à dix-huit mois et un seul faux signal. C'est "
+                "le meilleur prédicteur macroéconomique connu, et aussi l'un "
+                "des plus lents : l'inversion peut durer plus d'un an avant que "
+                "quoi que ce soit ne se produise."
+            )
+
+            ecart = series_courbe.get("T10Y2Y")
+            if ecart is not None and not ecart.empty:
+                st.markdown("**Historique de l'écart 10 ans − 2 ans**")
+                st.line_chart(ecart.tail(2600), height=300)
+
+    # ----------------------------------------------------------------------
+    with sous[3]:
+        st.caption("Indicateurs de marché en temps quasi réel, via Yahoo.")
+
+        @st.cache_data(ttl=900, show_spinner=False)
+        def charger_marches(periode: str) -> pd.DataFrame:
+            return charger_cours(tuple(mc.MARCHE), periode, "1d")
+
+        periode_m = st.selectbox("Période", ["3mo", "6mo", "1y", "2y", "5y"],
+                                 index=2, key="periode_marches")
+        with st.spinner("Chargement…"):
+            marches = charger_marches(periode_m)
+
+        if marches.empty:
+            st.error("Données de marché indisponibles.")
+        else:
+            lignes = []
+            for code, libelle in mc.MARCHE.items():
+                if code not in marches.columns:
+                    continue
+                serie = marches[code].dropna()
+                if len(serie) < 30:
+                    continue
+                lignes.append({
+                    "Indicateur": libelle,
+                    "Niveau": float(serie.iloc[-1]),
+                    "1 jour (%)": float(serie.iloc[-1] / serie.iloc[-2] - 1) * 100,
+                    "1 mois (%)": float(serie.iloc[-1] / serie.iloc[-22] - 1) * 100
+                    if len(serie) > 22 else np.nan,
+                    "Depuis le début (%)": float(serie.iloc[-1] / serie.iloc[0] - 1) * 100,
+                    "Volatilité (%)": an.volatilite(serie.pct_change().dropna()) * 100,
+                })
+            st.dataframe(pd.DataFrame(lignes).set_index("Indicateur").round(2),
+                         use_container_width=True)
+
+            st.markdown("**Comparaison en base 100**")
+            choix_m = st.multiselect(
+                "Indicateurs", [mc.MARCHE[c] for c in marches.columns
+                                if c in mc.MARCHE],
+                default=[mc.MARCHE[c] for c in ["^GSPC", "^VIX", "GC=F"]
+                         if c in marches.columns])
+            inverse = {v: k for k, v in mc.MARCHE.items()}
+            codes_m = [inverse[n] for n in choix_m if inverse[n] in marches.columns]
+            if codes_m:
+                base_m = marches[codes_m].dropna()
+                base_m = base_m / base_m.iloc[0] * 100
+                base_m.columns = [mc.MARCHE[c] for c in codes_m]
+                st.line_chart(base_m, height=340)
+
+
+with onglets[13]:
+    st.subheader("Qualité des données")
+
+    st.warning(
+        "yfinance est un scraper non officiel de Yahoo Finance, sans garantie "
+        "ni engagement de service. Les cours quotidiens des grandes valeurs "
+        "sont globalement corrects ; les fondamentaux et le consensus "
+        "proviennent de fournisseurs tiers et comportent des erreurs avérées. "
+        "Cet onglet ne corrige rien — il signale ce qui est détectable."
+    )
+
+    st.markdown("**Contrôle de tes lignes**")
+    with st.spinner("Analyse en cours…"):
+        tableau_qualite = ql.controler_univers(cours[list(val.index)])
+
+    st.dataframe(tableau_qualite, use_container_width=True)
+
+    douteux = tableau_qualite[tableau_qualite["Score"] < 65]
+    if not douteux.empty:
+        st.error(
+            "Données douteuses sur : " + ", ".join(douteux.index)
+            + ". Vérifie ces valeurs sur finance.yahoo.com avant de te fier "
+              "aux calculs qui en dépendent."
+        )
+    else:
+        st.success("Aucune anomalie détectable sur tes lignes.")
+
+    st.divider()
+    st.markdown("**Examen détaillé d'une valeur**")
+
+    ticker_q = st.selectbox("Valeur", list(val.index), key="ticker_qualite")
+    rapport = ql.controler(cours[ticker_q].dropna())
+    score = ql.score_qualite(rapport)
+
+    q = st.columns(4)
+    q[0].metric("Score de qualité", f"{score['score']} / 100", score["niveau"])
+    q[1].metric("Séances", rapport["profondeur"].get("séances disponibles", 0))
+    q[2].metric("Couverture",
+                fmt(rapport["profondeur"].get("taux de couverture (%)"), 0, " %"))
+    q[3].metric("Fraîcheur", rapport["fraîcheur"].get("état", "—"))
+
+    for cle, titre in [
+        ("valeurs impossibles", "Cours nuls ou négatifs"),
+        ("variations extrêmes", "Variations extrêmes"),
+        ("cours figés", "Périodes de cours figé"),
+        ("séances manquantes", "Interruptions d'historique"),
+    ]:
+        table = rapport.get(cle)
+        if isinstance(table, pd.DataFrame) and not table.empty:
+            st.markdown(f"**{titre}** — {len(table)} cas")
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
+    if score["score"] >= 85:
+        st.caption(
+            "Aucune anomalie détectable. Attention : cela ne prouve pas que "
+            "les données sont exactes. Une erreur de retraitement de dividende "
+            "ne laisse aucune trace visible et passera ce contrôle sans être "
+            "repérée."
+        )
+
+    st.divider()
+    st.markdown("**Vérification croisée avec une source indépendante**")
+    st.caption(
+        "Compare les cours Yahoo à ceux de Stooq, un fournisseur polonais sans "
+        "lien avec Yahoo. Deux sources indépendantes qui concordent constituent "
+        "une présomption sérieuse ; deux sources qui divergent signalent qu'au "
+        "moins l'une des deux se trompe."
+    )
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def croiser(ticker: str, _serie_yahoo: pd.Series) -> dict:
+        return ql.comparer_sources(_serie_yahoo, ql.charger_stooq(ticker))
+
+    if st.button("Lancer la vérification croisée"):
+        with st.spinner("Interrogation de Stooq…"):
+            comparaison = croiser(ticker_q, cours[ticker_q].dropna())
+
+        if not comparaison.get("comparable"):
+            st.info(
+                f"Comparaison impossible : {comparaison.get('raison')}. "
+                "Stooq ne couvre pas les indices, devises et cryptos avec les "
+                "mêmes conventions de tickers."
+            )
+        else:
+            v = st.columns(4)
+            v[0].metric("Dates comparées", comparaison["dates comparées"])
+            v[1].metric("Écart médian", fmt(comparaison["écart médian (%)"], 3, " %"))
+            v[2].metric("Écart maximal", fmt(comparaison["écart maximal (%)"], 2, " %"))
+            v[3].metric("Dates divergentes", comparaison["dates divergentes"],
+                        fmt(comparaison["part divergente (%)"], 1, " %"))
+
+            if comparaison["dates divergentes"] == 0:
+                st.success(comparaison["verdict"])
+            else:
+                st.warning(comparaison["verdict"])
+                st.dataframe(comparaison["détail"].round(3),
+                             use_container_width=True)
+
+    st.divider()
+    with st.expander("Ce que cet outil ne peut pas garantir"):
+        st.markdown("""
+**Sources par niveau de fiabilité.**
+
+*FRED* (onglet Macro) est la base officielle de la Réserve fédérale de
+Saint-Louis, en accès direct. Qualité institutionnelle, aucune réserve.
+
+*Cours quotidiens Yahoo* sur les grandes capitalisations américaines et
+européennes : globalement corrects, ajustés des dividendes et fractionnements.
+Précision moins constante hors de ces marchés.
+
+*Fondamentaux et consensus* : proviennent de fournisseurs tiers via Yahoo. Des
+écarts avec les documents officiels des entreprises sont documentés. À
+recouper avec le rapport annuel avant tout engagement significatif.
+
+*Listes de valeurs* (`univers.py`) : figées à la date où je les ai écrites. Les
+compositions d'indices changent — entrées, sorties, fusions. À réviser
+périodiquement.
+
+**Limites structurelles que rien ne détecte.**
+
+Le biais du survivant : Yahoo ne conserve pas les sociétés radiées ou
+faillies. Tout backtest sur une liste actuelle surestime donc mécaniquement
+les rendements passés, puisque les disparues ont été retirées de l'échantillon.
+
+Les erreurs de retraitement des dividendes, qui ne laissent aucune trace
+visible dans la série.
+
+Les cours différés de plusieurs minutes en séance — sans conséquence pour
+l'analyse, disqualifiant pour l'exécution.
+
+**Ce qu'il faudrait pour un usage professionnel.** Un fournisseur officiel
+sous contrat : Refinitiv, FactSet, Bloomberg, ou plus modestement Polygon ou
+Twelve Data. Comptez de quelques dizaines à plusieurs milliers d'euros par
+mois. Cet outil est conçu pour l'analyse personnelle, pas pour gérer l'argent
+de tiers.
+        """)
