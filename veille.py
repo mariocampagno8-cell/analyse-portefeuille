@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+import mise_en_forme as mf
 import redaction as rd
 import signaux as sg
 
@@ -394,6 +396,7 @@ def envoyer_telegram(message: str, jeton: str, destinataire: str) -> bool:
         reponse = requests.post(
             f"https://api.telegram.org/bot{jeton}/sendMessage",
             json={"chat_id": str(destinataire).strip(), "text": message,
+                  "parse_mode": "HTML",
                   "disable_web_page_preview": True},
             timeout=20,
         )
@@ -419,19 +422,20 @@ def notifier(alertes: list[dict]) -> int:
           f" | ntfy : {'configuré' if sujet_ntfy else 'absent'}")
 
     if jeton_tg and dest_tg:
-        # Telegram limite un message à 4096 caractères : on découpe si besoin
-        blocs, courant = [], "📊 VEILLE PORTEFEUILLE\n"
+        # Un message par alerte : chacune arrive séparément, à lire d'un coup
+        # d'œil. Les blocs groupés sont survolés puis oubliés.
         for a in alertes:
-            morceau = f"\n▸ {a['titre']}\n{a['corps']}\n"
-            if len(courant) + len(morceau) > 3800:
-                blocs.append(courant)
-                courant = morceau
-            else:
-                courant += morceau
-        blocs.append(courant)
-        for bloc in blocs:
-            if envoyer_telegram(bloc, jeton_tg, dest_tg):
+            corps = a.get("html") or mf.message_signal(
+                a["titre"], a["corps"], a.get("ticker", ""),
+                surveille=a.get("surveille", False),
+                chiffres=a.get("chiffres"))
+            valide, motif = mf.valider(corps)
+            if not valide:
+                print(f"Message écarté : {motif}", file=sys.stderr)
+                continue
+            if envoyer_telegram(corps, jeton_tg, dest_tg):
                 envois += 1
+                time.sleep(1)          # Telegram limite à ~30 messages/seconde
 
     if sujet_ntfy:
         for alerte in alertes:
@@ -451,6 +455,34 @@ def notifier(alertes: list[dict]) -> int:
 # Exécution
 # ==========================================================================
 
+def charger_surveillance() -> list[str]:
+    """
+    Liste de valeurs suivies sans etre detenues.
+
+    Deux sources possibles : une liste de tickers dans TICKERS_SURVEILLANCE
+    (« NVDA, ASML.AS, MC.PA »), ou un second onglet Google publie dont
+    l'adresse est dans URL_SURVEILLANCE. La premiere colonne suffit.
+    """
+    brut = os.environ.get("TICKERS_SURVEILLANCE", "").strip()
+    if brut:
+        return [t.strip().upper() for t in brut.replace(";", ",").split(",")
+                if t.strip()]
+
+    url = os.environ.get("URL_SURVEILLANCE", "").strip()
+    if not url:
+        return []
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import feuille as fe
+        df = pd.read_csv(fe.urls_candidates(url)[0])
+        colonne = df.columns[0]
+        return [str(t).strip().upper() for t in df[colonne].dropna()
+                if str(t).strip()]
+    except Exception as erreur:
+        print(f"Liste de surveillance illisible : {erreur}", file=sys.stderr)
+        return []
+
+
 def charger_portefeuille() -> pd.DataFrame:
     """Portefeuille depuis la feuille Google publiee."""
     url = os.environ.get("URL_FEUILLE", "")
@@ -461,11 +493,41 @@ def charger_portefeuille() -> pd.DataFrame:
     return fe.lire(url)
 
 
+# Signaux jugés urgents : eux seuls passent en mode surveillance
+URGENTS = {"publication_proche", "drawdown_portefeuille", "volatilite_anormale",
+           "retournement_momentum", "regime"}
+
+
+def filtrer_par_mode(alertes: list[dict], mode: str) -> list[dict]:
+    """
+    Sélectionne les alertes selon le moment de la journée.
+
+    En mode `urgence`, seul passe ce qui ne peut pas attendre le rendez-vous
+    du soir : un décrochage, une publication imminente, un changement de
+    régime. Tout le reste — momentum, révisions, valorisation — se lit très
+    bien douze heures plus tard, et l'envoyer immédiatement ne ferait
+    qu'éroder l'attention portée aux vraies urgences.
+    """
+    if mode != "urgence":
+        return alertes
+    return [a for a in alertes
+            if a.get("priorite") == "haute"
+            or any(cle in a.get("id", "") for cle in URGENTS)]
+
+
 def principal() -> int:
+    mode = os.environ.get("MODE_VEILLE", "soir")
+    print(f"Mode : {mode}")
     regles = charger_config()
     portefeuille = charger_portefeuille()
-    tickers = list(dict.fromkeys(portefeuille["Ticker"]))
-    print(f"{len(tickers)} valeur(s) suivie(s) : {', '.join(tickers)}")
+    detenues = list(dict.fromkeys(portefeuille["Ticker"]))
+    surveillance = [t for t in charger_surveillance() if t not in detenues]
+    tickers = detenues + surveillance
+
+    print(f"{len(detenues)} valeur(s) détenue(s) : {', '.join(detenues)}")
+    if surveillance:
+        print(f"{len(surveillance)} valeur(s) surveillée(s) : "
+              f"{', '.join(surveillance)}")
 
     donnees = yf.download(tickers, period="2y", interval="1d",
                           auto_adjust=True, progress=False, group_by="column")
@@ -510,7 +572,10 @@ def principal() -> int:
                 parts_risque = {t: float(c / vol * 100)
                                 for t, c in zip(w.index, contributions)}
 
-        for t, valeur in valeurs.items():
+        a_analyser = {t: valeurs.get(t) for t in tickers
+                      if t in cours.columns and not cours[t].dropna().empty}
+
+        for t, valeur in a_analyser.items():
             info, surprises, revisions = {}, None, None
             try:
                 ticker_yf = yf.Ticker(t)
@@ -532,7 +597,9 @@ def principal() -> int:
                 pass
 
             contextes[t] = sg.contexte_societe(
-                t, cours[t], poids_pct=valeur / total_ptf * 100,
+                t, cours[t],
+                poids_pct=(valeur / total_ptf * 100
+                           if valeur is not None and total_ptf > 0 else None),
                 part_risque_pct=parts_risque.get(t),
                 info=info, surprises=surprises, revisions=revisions)
 
@@ -554,16 +621,34 @@ def principal() -> int:
         print(f"{len(alertes_signaux)} signal(aux) déclenché(s).")
 
         # Rédaction par Claude, avec repli sur les gabarits en cas d'échec
-        alertes_signaux = rd.enrichir(alertes_signaux, contextes,
-                                      os.environ.get("CLE_ANTHROPIC", ""))
+        if mode != "urgence":
+            alertes_signaux = rd.enrichir(alertes_signaux, contextes,
+                                          os.environ.get("CLE_ANTHROPIC", ""))
         rediges = sum(1 for a in alertes_signaux if a.get("rédigé_par_ia"))
         print(f"{rediges} commentaire(s) rédigé(s) par IA.")
 
         for a in alertes_signaux:
+            contexte_a = contextes.get(a["ticker"], {})
+            chiffres = {}
+            for libelle, cle_ctx, unite in [
+                ("Poids", "poids_pct", " %"),
+                ("Part du risque", "part_risque_pct", " %"),
+                ("Volatilité", "volatilite_pct", " %"),
+                ("Écart au plus haut", "ecart_plus_haut_pct", " %"),
+            ]:
+                valeur_c = contexte_a.get(cle_ctx)
+                if valeur_c is not None:
+                    chiffres[libelle] = f"{valeur_c:.0f}{unite}"
+
+            # Le titre porte déjà le nom : on ne garde que la nature du signal
+            titre_court = a["titre"].split(" — ")[-1]
             alertes.append({
                 "id": f"signal|{a['type']}|{a['ticker']}|"
                       f"{datetime.now().strftime('%Y-%W')}",
-                "titre": a["titre"],
+                "titre": titre_court,
+                "ticker": a["ticker"],
+                "surveille": a["ticker"] in surveillance,
+                "chiffres": chiffres,
                 "corps": a["commentaire"],
                 "priorite": "normale",
             })
@@ -573,12 +658,27 @@ def principal() -> int:
 
     print(f"{len(alertes)} alerte(s) au total.")
 
+    alertes = filtrer_par_mode(alertes, mode)
+    if mode == "urgence":
+        print(f"{len(alertes)} alerte(s) retenue(s) comme urgentes.")
+
     etat = lire_etat()
     nouvelles = [a for a in alertes if not deja_signalee(etat, a["id"])]
     print(f"{len(nouvelles)} nouvelle(s) après filtrage anti-répétition.")
 
     if not nouvelles:
         return 0
+
+    # Quota par passage : étale les alertes sur la journée plutôt que de tout
+    # déverser d'un coup. Le reste attend le passage suivant.
+    quota = int(os.environ.get("QUOTA_PAR_PASSAGE",
+                               "5" if mode == "urgence" else "3"))
+    ordre = {"haute": 0, "normale": 1, "basse": 2}
+    nouvelles.sort(key=lambda a: ordre.get(a.get("priorite"), 3))
+    if len(nouvelles) > quota:
+        print(f"Quota de {quota} par passage : {len(nouvelles) - quota} "
+              f"alerte(s) reportée(s) au prochain passage.")
+        nouvelles = nouvelles[:quota]
 
     envois = notifier(nouvelles)
     print(f"{envois} notification(s) envoyée(s).")

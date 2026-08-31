@@ -37,7 +37,8 @@ JOURS_BOURSE = 252
 # Contexte propre à chaque société
 # ==========================================================================
 
-def contexte_societe(ticker: str, cours: pd.Series, poids_pct: float,
+def contexte_societe(ticker: str, cours: pd.Series,
+                     poids_pct: float | None = None,
                      part_risque_pct: float | None = None,
                      info: dict | None = None,
                      surprises: pd.DataFrame | None = None,
@@ -54,7 +55,8 @@ def contexte_societe(ticker: str, cours: pd.Series, poids_pct: float,
         "ticker": ticker,
         "nom": info.get("longName") or info.get("shortName") or ticker,
         "secteur": info.get("sector"),
-        "poids_pct": round(float(poids_pct), 1),
+        "poids_pct": (round(float(poids_pct), 1)
+                      if poids_pct is not None else None),
         "part_risque_pct": (round(float(part_risque_pct), 1)
                             if part_risque_pct is not None
                             and np.isfinite(part_risque_pct) else None),
@@ -286,6 +288,8 @@ def commenter(signal: dict, c: dict) -> str:
     """
     nom = c.get("nom", c["ticker"])
     position = _phrase_position(c)
+    # Hors portefeuille, aucune phrase de position n'est insérée
+    situe = f" C'est {position}." if position else ""
     secteur = f" ({c['secteur']})" if c.get("secteur") else ""
     type_signal = signal["type"]
 
@@ -295,7 +299,7 @@ def commenter(signal: dict, c: dict) -> str:
             texte = (
                 f"{nom}{secteur} est {signal['rang']}e sur {signal['total']} "
                 f"valeurs suivies au classement momentum, avec {signal['score_pct']:+.0f} % "
-                f"sur douze mois hors dernier mois. C'est {position}. "
+                f"sur douze mois hors dernier mois.{situe} "
                 "Le momentum à douze mois est l'anomalie la mieux documentée de "
                 "la finance empirique, mais elle se retourne brutalement : "
                 "sa pire séquence a effacé près de 40 % en trois mois."
@@ -311,7 +315,7 @@ def commenter(signal: dict, c: dict) -> str:
         texte = (
             f"{nom}{secteur} est {_rang(signal['rang'])} sur {signal['total']} au "
             f"classement momentum, avec {signal['score_pct']:+.0f} % sur la période. "
-            f"C'est {position}. Les titres en queue de classement tendent à "
+            f"{situe} Les titres en queue de classement tendent à "
             "sous-performer encore quelques mois — l'effet est symétrique."
         )
         if c.get("potentiel_consensus_pct"):
@@ -324,7 +328,7 @@ def commenter(signal: dict, c: dict) -> str:
     if type_signal == "derive_resultats":
         texte = (
             f"{nom} a publié une surprise {signal['sens']} de "
-            f"{signal['surprise_pct']:+.1f} % sur son bénéfice. C'est {position}. "
+            f"{signal['surprise_pct']:+.1f} % sur son bénéfice.{situe} "
             "La dérive post-annonce est l'un des effets les mieux établis : "
             "le marché sous-réagit et le cours poursuit son mouvement six à "
             "neuf semaines."
@@ -359,8 +363,8 @@ def commenter(signal: dict, c: dict) -> str:
     if type_signal == "revisions":
         texte = (
             f"Les analystes ont révisé leurs estimations de bénéfice sur {nom} "
-            f"de {signal['revision_pct']:+.1f} % en trois mois, à la {signal['sens']}. "
-            f"C'est {position}. C'est la direction des révisions qui porte "
+            f"de {signal['revision_pct']:+.1f} % en trois mois, à la {signal['sens']}."
+            f"{situe} C'est la direction des révisions qui porte "
             "l'information, jamais le niveau du consensus, structurellement "
             "optimiste."
         )
@@ -375,7 +379,7 @@ def commenter(signal: dict, c: dict) -> str:
         if signal["etat"] == "proche":
             return (
                 f"{nom} évolue à {abs(signal['ecart_pct']):.0f} % de son plus haut "
-                f"sur 52 semaines. C'est {position}. Contrairement à l'intuition, "
+                f"sur 52 semaines.{situe} Contrairement à l'intuition, "
                 "George et Hwang ont montré que les titres proches de leur plus "
                 "haut surperforment : les investisseurs hésitent à acheter ce qui "
                 "semble cher, et l'information met du temps à s'intégrer."
@@ -384,8 +388,8 @@ def commenter(signal: dict, c: dict) -> str:
                    if c.get("volatilite_pct") else "")
             )
         texte = (
-            f"{nom} est {abs(signal['ecart_pct']):.0f} % sous son plus haut annuel. "
-            f"C'est {position}. Un écart de cette ampleur n'est pas une occasion "
+            f"{nom} est {abs(signal['ecart_pct']):.0f} % sous son plus haut annuel."
+            f"{situe} Un écart de cette ampleur n'est pas une occasion "
             "en soi — statistiquement, les titres éloignés de leur plus haut "
             "continuent plutôt de sous-performer."
         )
