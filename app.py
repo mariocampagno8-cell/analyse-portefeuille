@@ -20,6 +20,7 @@ from plotly.subplots import make_subplots
 
 import acces as ac
 import analytics as an
+import assistant as asst
 import feuille as fe
 import fondamentaux as fo
 import indicateurs as ind
@@ -204,8 +205,15 @@ onglets = st.tabs([
     "Portefeuille", "Risque et bêta", "Corrélations", "Optimisation",
     "Simulation et stress", "Backtest", "Analyse d'une valeur", "Données",
     "Screener", "Indicateurs", "Fondamentaux", "Résultats et consensus",
-    "Macro et calendrier", "Qualité des données",
+    "Macro et calendrier", "Qualité des données", "Assistant",
+    "Valeurs surveillées",
 ])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_liste_surveillance(url: str) -> list[str]:
+    """Liste de surveillance depuis Google Sheets. Cache 5 min."""
+    return fe.lire_liste(url)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -899,6 +907,73 @@ with onglets[8]:
                                key="periode_screener")
 
     liste = sorted({t for u_ in choix_univers for t in univ.UNIVERS[u_]})
+
+    with st.expander("Personnaliser ma liste de surveillance"):
+        st.caption(
+            "Colle tes tickers séparés par des virgules ou des retours à la "
+            "ligne. Cette liste remplace celle sélectionnée ci-dessus. Pour la "
+            "rendre permanente, mets-la dans le secret Streamlit "
+            "`tickers_surveillance`."
+        )
+        url_surveillance = ""
+        depuis_secrets = ""
+        try:
+            url_surveillance = st.secrets.get("url_surveillance", "")
+            depuis_secrets = st.secrets.get("tickers_surveillance", "")
+        except Exception:
+            pass
+
+        url_saisie = st.text_input(
+            "Adresse de ma feuille de surveillance",
+            value=url_surveillance,
+            help="Second onglet de ton classeur Google, publié au format CSV. "
+                 "Tu le modifies depuis ton téléphone, l'app le relit ici.",
+            key="url_surveillance")
+
+        depuis_feuille = []
+        if url_saisie.strip():
+            col_a, col_b = st.columns([1, 3])
+            if col_a.button("Recharger", use_container_width=True,
+                            key="recharger_surveillance"):
+                lire_liste_surveillance.clear()
+            try:
+                depuis_feuille = lire_liste_surveillance(url_saisie.strip())
+                col_b.success(f"{len(depuis_feuille)} valeur(s) lue(s) "
+                              "depuis la feuille.")
+            except ValueError as erreur:
+                col_b.error(str(erreur))
+
+        saisie_liste = st.text_area(
+            "Ou saisis directement tes valeurs",
+            value=", ".join(depuis_feuille) if depuis_feuille else depuis_secrets,
+            placeholder="AAPL, MSFT, AIR.PA, ASML.AS…", height=120,
+            key="liste_perso")
+
+        if saisie_liste.strip():
+            perso = [t.strip().upper() for t in
+                     saisie_liste.replace(";", ",").replace("\n", ",").split(",")
+                     if t.strip()]
+            liste = sorted(dict.fromkeys(perso))
+            st.success(f"Liste personnalisée retenue : {len(liste)} valeurs.")
+
+        with st.expander("Comment créer la feuille"):
+            st.markdown(
+                "Dans ton classeur Google, clique sur le **+** en bas à gauche "
+                "pour ajouter un onglet. Mets `Ticker` en A1, puis un ticker "
+                "par ligne. Ensuite **Fichier → Partager → Publier sur le "
+                "web**, choisis cet onglet et le format **CSV**, publie, et "
+                "colle l'adresse ci-dessus."
+            )
+            st.dataframe(fe.MODELE_SURVEILLANCE, use_container_width=True,
+                         hide_index=True)
+
+        st.download_button(
+            "Exporter la liste sélectionnée",
+            ", ".join(liste).encode("utf-8"),
+            "surveillance.txt", "text/plain",
+            help="À coller dans le secret GitHub TICKERS_SURVEILLANCE "
+                 "pour que la veille automatique suive les mêmes valeurs.")
+
     st.caption(f"{len(liste)} valeurs sélectionnées.")
 
     if len(liste) > 150:
@@ -1769,3 +1844,314 @@ Twelve Data. Comptez de quelques dizaines à plusieurs milliers d'euros par
 mois. Cet outil est conçu pour l'analyse personnelle, pas pour gérer l'argent
 de tiers.
         """)
+
+
+with onglets[14]:
+    st.subheader("Assistant")
+
+    cle_api = ""
+    try:
+        cle_api = st.secrets.get("cle_anthropic", "")
+    except Exception:
+        pass
+
+    if not cle_api:
+        st.info(
+            "Pour activer l'assistant, ajoute ta clé API dans les secrets "
+            "Streamlit :\n\n"
+            "```\ncle_anthropic = \"sk-ant-...\"\n```\n\n"
+            "Une clé se crée sur console.anthropic.com. Compte environ un "
+            "centime par question. Ne mets jamais cette clé dans le code : "
+            "des robots parcourent GitHub en permanence à la recherche de clés "
+            "publiées, et elles sont exploitées en quelques minutes."
+        )
+        st.stop()
+
+    st.caption(
+        "L'assistant lit les chiffres calculés par l'application et les "
+        "explique. Il ne calcule rien lui-même — un modèle de langage est "
+        "mauvais en arithmétique — et ne donne aucun conseil d'investissement."
+    )
+
+    a1, a2 = st.columns([2, 1])
+    modele = a1.selectbox("Modèle", list(asst.MODELES),
+                          format_func=lambda m: asst.MODELES[m])
+    if a2.button("Effacer la conversation", use_container_width=True):
+        st.session_state.pop("discussion", None)
+        st.rerun()
+
+    # Contexte : uniquement des résultats déjà calculés par Python
+    contexte = asst.construire_contexte(
+        valorisation=val[["Quantité", "Devise", "Cours", "PRU", "Valeur",
+                          "Plus-value", "Performance (%)", "Poids (%)"]],
+        metriques=an.tableau_metriques(rdt_ptf, rdt_bench, taux_sans_risque, freq),
+        decomposition=an.decomposition_risque(poids, cov),
+        correlations=rdt.corr(),
+        parametres={
+            "période": periode,
+            "intervalle": intervalle,
+            "indice_de_référence": nom_indice,
+            "devise": devise_base,
+            "taux_sans_risque": taux_sans_risque,
+            "valeur_totale": round(float(total), 2),
+            "nombre_de_lignes": int(len(val)),
+        },
+        diversification={
+            "ratio_de_diversification":
+                round(float(an.ratio_diversification(poids, cov)), 3),
+            "lignes_effectives":
+                round(float(an.nombre_effectif_lignes(poids)), 2),
+        },
+    )
+
+    with st.expander("Ce que l'assistant reçoit exactement"):
+        st.caption(
+            "Rien d'autre que ceci. S'il évoque un chiffre absent de ce bloc, "
+            "c'est qu'il l'a inventé — signale-le moi."
+        )
+        st.json(contexte)
+
+    if "discussion" not in st.session_state:
+        st.session_state.discussion = []
+
+    for message in st.session_state.discussion:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if not st.session_state.discussion:
+        st.markdown("**Quelques questions pour commencer**")
+        colonnes_s = st.columns(2)
+        for i, suggestion in enumerate(asst.SUGGESTIONS):
+            if colonnes_s[i % 2].button(suggestion, key=f"suggestion_{i}",
+                                        use_container_width=True):
+                st.session_state.question_en_attente = suggestion
+                st.rerun()
+
+    question = st.chat_input("Pose ta question sur le portefeuille…")
+    if "question_en_attente" in st.session_state:
+        question = st.session_state.pop("question_en_attente")
+
+    if question:
+        st.session_state.discussion.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyse…"):
+                try:
+                    reponse = asst.interroger(
+                        question, contexte, cle_api,
+                        historique=st.session_state.discussion[:-1],
+                        modele=modele,
+                    )
+                    st.markdown(reponse)
+                    st.session_state.discussion.append(
+                        {"role": "assistant", "content": reponse})
+                except Exception as erreur:
+                    st.error(f"Appel impossible : {erreur}")
+
+    st.divider()
+    st.caption(
+        "Rappel : cet assistant explique des chiffres, il ne recommande rien. "
+        "Les mesures reposent sur des données yfinance et sur des estimations "
+        "statistiques imprécises. La décision reste la tienne."
+    )
+
+
+with onglets[15]:
+    st.subheader("Valeurs surveillées")
+
+    url_surv = ""
+    try:
+        url_surv = st.secrets.get("url_surveillance", "")
+    except Exception:
+        pass
+
+    entete_a, entete_b = st.columns([4, 1])
+    url_surv = entete_a.text_input(
+        "Feuille de surveillance",
+        value=url_surv,
+        help="Second onglet de ton classeur Google, publié au format CSV. "
+             "Tu le modifies depuis ton téléphone, l'app le relit ici.",
+        key="url_surv_onglet",
+        label_visibility="collapsed",
+        placeholder="Adresse de ta feuille de surveillance…")
+    if entete_b.button("Recharger", use_container_width=True,
+                       key="recharger_surv_onglet"):
+        lire_liste_surveillance.clear()
+        st.rerun()
+
+    if not url_surv.strip():
+        st.info(
+            "Renseigne l'adresse de ta feuille de surveillance, ou ajoute "
+            "`url_surveillance` dans les secrets Streamlit pour qu'elle se "
+            "remplisse toute seule."
+        )
+        with st.expander("Créer la feuille"):
+            st.markdown(
+                "Dans ton classeur Google, ajoute un onglet avec le **+** en "
+                "bas à gauche. Mets `Ticker` en A1, puis un ticker par ligne. "
+                "Ensuite **Fichier → Partager → Publier sur le web**, "
+                "sélectionne **cet onglet** et le format **CSV**."
+            )
+            st.dataframe(fe.MODELE_SURVEILLANCE, use_container_width=True,
+                         hide_index=True)
+        st.stop()
+
+    try:
+        with st.spinner("Lecture de la feuille…"):
+            surveillees = lire_liste_surveillance(url_surv.strip())
+    except ValueError as erreur:
+        st.error(str(erreur))
+        st.stop()
+
+    st.caption(f"{len(surveillees)} valeur(s) suivie(s), lues depuis ta feuille. "
+               "Modifie-la depuis ton téléphone puis clique sur Recharger.")
+
+    periode_surv = st.selectbox(
+        "Période d'analyse", ["6mo", "1y", "2y", "5y"], index=1,
+        key="periode_surveillance")
+
+    @st.cache_data(ttl=1800, show_spinner=False)
+    def analyser_surveillance(tickers: tuple[str, ...], periode: str,
+                              indice: str) -> pd.DataFrame:
+        """Mesures de suivi pour chaque valeur surveillée. Cache 30 min."""
+        donnees = charger_cours(tickers + (indice,), periode, "1d")
+        if donnees.empty:
+            return pd.DataFrame()
+
+        r_indice = (donnees[indice].pct_change()
+                    if indice in donnees.columns else pd.Series(dtype=float))
+        lignes = []
+        for t in tickers:
+            if t not in donnees.columns:
+                continue
+            prix = donnees[t].dropna()
+            if len(prix) < 30:
+                continue
+            r = prix.pct_change().dropna()
+
+            entree = {
+                "Ticker": t,
+                "Cours": float(prix.iloc[-1]),
+                "1 jour (%)": float(prix.iloc[-1] / prix.iloc[-2] - 1) * 100
+                if len(prix) > 1 else np.nan,
+                "1 mois (%)": float(prix.iloc[-1] / prix.iloc[-22] - 1) * 100
+                if len(prix) > 22 else np.nan,
+                "Depuis le début (%)": float(prix.iloc[-1] / prix.iloc[0] - 1) * 100,
+                "RSI": float(ind.rsi(prix).iloc[-1]),
+                "Volatilité (%)": an.volatilite(r) * 100,
+                "Drawdown max (%)": an.drawdown_max(r) * 100,
+            }
+            if len(prix) > 200:
+                entree["vs MM200 (%)"] = float(
+                    prix.iloc[-1] / prix.rolling(200).mean().iloc[-1] - 1) * 100
+            if len(prix) > 252:
+                entree["Écart plus haut (%)"] = float(
+                    ind.distance_plus_haut(prix).iloc[-1])
+                entree["Momentum 12-1 (%)"] = float(
+                    ind.momentum_absolu(prix).iloc[-1]) * 100
+            if len(r_indice):
+                entree["Bêta"] = an.regression_marche(
+                    r, r_indice, taux_sans_risque)["beta"]
+            lignes.append(entree)
+
+        return pd.DataFrame(lignes).set_index("Ticker") if lignes else pd.DataFrame()
+
+    with st.spinner(f"Analyse de {len(surveillees)} valeurs…"):
+        tableau_surv = analyser_surveillance(
+            tuple(surveillees), periode_surv, benchmark)
+
+    if tableau_surv.empty:
+        st.error("Aucune donnée exploitable. Vérifie tes tickers sur "
+                 "finance.yahoo.com.")
+        st.stop()
+
+    introuvables = [t for t in surveillees if t not in tableau_surv.index]
+    if introuvables:
+        st.warning("Tickers sans données : " + ", ".join(introuvables)
+                   + ". Vérifie leur orthographe exacte sur finance.yahoo.com.")
+
+    m = st.columns(4)
+    m[0].metric("Valeurs suivies", len(tableau_surv))
+    if "1 jour (%)" in tableau_surv.columns:
+        hausse = int((tableau_surv["1 jour (%)"] > 0).sum())
+        m[1].metric("En hausse aujourd'hui", f"{hausse} / {len(tableau_surv)}")
+    m[2].metric("Performance médiane 1 mois",
+                fmt(tableau_surv["1 mois (%)"].median(), 1, " %")
+                if "1 mois (%)" in tableau_surv.columns else "—")
+    if "vs MM200 (%)" in tableau_surv.columns:
+        au_dessus = int((tableau_surv["vs MM200 (%)"] > 0).sum())
+        m[3].metric("Au-dessus de la MM200",
+                    f"{au_dessus} / {len(tableau_surv)}",
+                    help="Part des valeurs en tendance haussière de fond.")
+
+    tri = st.selectbox("Trier par", list(tableau_surv.columns),
+                       index=list(tableau_surv.columns).index("1 mois (%)")
+                       if "1 mois (%)" in tableau_surv.columns else 0,
+                       key="tri_surveillance")
+    st.dataframe(tableau_surv.sort_values(tri, ascending=False).round(2),
+                 use_container_width=True, height=560)
+
+    st.download_button("Exporter (CSV)", tableau_surv.to_csv().encode("utf-8"),
+                       "surveillance.csv", "text/csv")
+
+    st.divider()
+    st.subheader("Prochaines publications")
+    st.caption(
+        "Les jours de publication concentrent une part importante de la "
+        "volatilité annuelle d'un titre. Le sens du mouvement dépend de "
+        "l'écart aux attentes, pas de la qualité absolue des chiffres."
+    )
+
+    @st.cache_data(ttl=21600, show_spinner=False)
+    def publications_surveillance(tickers: tuple[str, ...]) -> pd.DataFrame:
+        """Dates de publication à venir. Cache 6 h."""
+        lignes = []
+        maintenant = pd.Timestamp.now().normalize()
+        for t in tickers:
+            try:
+                dates = yf.Ticker(t).earnings_dates
+                if dates is None or dates.empty:
+                    continue
+                index = pd.to_datetime(dates.index)
+                index = index.tz_localize(None) if index.tz is not None else index
+                table = dates.copy()
+                table.index = index
+                futures = table[table.index >= maintenant]
+                if "Reported EPS" in table.columns:
+                    futures = futures[futures["Reported EPS"].isna()]
+                if futures.empty:
+                    continue
+                prochaine = futures.sort_index()
+                lignes.append({
+                    "Ticker": t,
+                    "Date": prochaine.index[0],
+                    "Dans (jours)": int((prochaine.index[0] - maintenant).days),
+                    "BPA attendu": float(prochaine.iloc[0].get(
+                        "EPS Estimate", np.nan)),
+                })
+            except Exception:
+                continue
+        return (pd.DataFrame(lignes).sort_values("Date").reset_index(drop=True)
+                if lignes else pd.DataFrame())
+
+    if st.button("Charger le calendrier des publications"):
+        with st.spinner("Interrogation en cours…"):
+            st.session_state.publications_surv = publications_surveillance(
+                tuple(tableau_surv.index))
+
+    calendrier_surv = st.session_state.get("publications_surv")
+    if calendrier_surv is not None:
+        if calendrier_surv.empty:
+            st.info("Aucune date de publication annoncée. C'est fréquent hors "
+                    "des États-Unis, où les calendriers sortent plus tard.")
+        else:
+            proches = calendrier_surv[calendrier_surv["Dans (jours)"] <= 7]
+            if not proches.empty:
+                st.warning(f"{len(proches)} publication(s) sous 7 jours : "
+                           + ", ".join(proches["Ticker"]))
+            st.dataframe(
+                calendrier_surv.assign(
+                    Date=calendrier_surv["Date"].dt.strftime("%d/%m/%Y")),
+                use_container_width=True, hide_index=True)

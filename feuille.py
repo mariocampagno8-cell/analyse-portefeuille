@@ -108,6 +108,44 @@ def _nombre(valeur) -> float:
         return np.nan
 
 
+def urls_candidates(url: str) -> list[str]:
+    """
+    Toutes les adresses de telechargement possibles pour une meme feuille.
+
+    Google expose trois points d'acces qui n'ont pas les memes exigences :
+      - `/pub?output=csv` : feuille publiee, accessible sans connexion ;
+      - `/gviz/tq?tqx=out:csv` : fonctionne si la feuille est partagee par lien ;
+      - `/export?format=csv` : exige d'etre connecte au compte proprietaire.
+
+    On les essaie dans cet ordre plutot que de deviner lequel s'applique.
+    """
+    url = url.strip()
+    if not url:
+        return []
+    if "output=csv" in url or "format=csv" in url or "out:csv" in url:
+        return [url]
+
+    identifiant = re.search(r"/spreadsheets/d/(?:e/)?([a-zA-Z0-9-_]+)", url)
+    if not identifiant:
+        return [url]
+
+    cle = identifiant.group(1)
+    gid = re.search(r"[#&?]gid=([0-9]+)", url)
+    numero = gid.group(1) if gid else None
+
+    if cle.startswith("2PACX") or "/d/e/" in url:
+        base = f"https://docs.google.com/spreadsheets/d/e/{cle}/pub?output=csv"
+        return [base + (f"&gid={numero}" if numero else "")]
+
+    racine = f"https://docs.google.com/spreadsheets/d/{cle}"
+    suffixe_gid = f"&gid={numero}" if numero else ""
+    return [
+        f"{racine}/gviz/tq?tqx=out:csv" + (f"&gid={numero}" if numero else ""),
+        f"{racine}/export?format=csv{suffixe_gid}",
+        f"{racine}/pub?output=csv{suffixe_gid}",
+    ]
+
+
 def lire(url: str) -> pd.DataFrame:
     """
     Telecharge et nettoie le portefeuille depuis la feuille.
@@ -116,17 +154,31 @@ def lire(url: str) -> pd.DataFrame:
     structuree : mieux vaut un message clair qu'un portefeuille vide et
     silencieux.
     """
-    adresse = url_csv(url)
-    if not adresse:
+    candidates = urls_candidates(url)
+    if not candidates:
         raise ValueError("Adresse de feuille vide.")
 
-    try:
-        df = pd.read_csv(adresse)
-    except Exception as erreur:
+    df, echecs = None, []
+    for adresse in candidates:
+        try:
+            essai = pd.read_csv(adresse)
+            if not essai.empty:
+                df = essai
+                break
+        except Exception as erreur:
+            echecs.append(f"{adresse.split('/')[-1][:28]} → {type(erreur).__name__}")
+
+    if df is None:
         raise ValueError(
-            "Feuille inaccessible. Vérifie qu'elle est bien publiée sur le web "
-            f"(Fichier → Partager → Publier sur le web). Détail : {erreur}"
-        ) from erreur
+            "Feuille inaccessible par aucun point d'accès.\n\n"
+            "Le plus fiable : dans Google Sheets, fais Fichier → Partager → "
+            "Publier sur le web, choisis le format **Valeurs séparées par des "
+            "virgules (.csv)** dans le second menu, publie, puis colle ici "
+            "l'adresse que Google affiche — celle qui contient « /pub?output=csv ».\n\n"
+            "À défaut, partage la feuille en lecture à « Tous les utilisateurs "
+            "disposant du lien ».\n\n"
+            f"Tentatives : {' | '.join(echecs)}"
+        )
 
     if df.empty:
         raise ValueError("La feuille est vide.")
@@ -186,4 +238,58 @@ MODELE = pd.DataFrame({
     "Ticker": ["AAPL", "MSFT", "AIR.PA", "TTE.PA"],
     "Quantité": [12, 8, 25, 40],
     "Prix d'achat": [165.20, 310.00, 128.40, 55.10],
+})
+
+
+# ==========================================================================
+# Liste de surveillance
+# ==========================================================================
+
+def lire_liste(url: str) -> list[str]:
+    """
+    Lit une liste de tickers depuis une feuille Google.
+
+    Tolerante par construction : accepte une colonne intitulee Ticker,
+    Symbole ou Valeur, ou a defaut la premiere colonne quelle qu'elle soit.
+    Une liste de surveillance n'a pas a respecter un format strict.
+    """
+    candidates = urls_candidates(url)
+    if not candidates:
+        raise ValueError("Adresse de feuille vide.")
+
+    df, echecs = None, []
+    for adresse in candidates:
+        try:
+            essai = pd.read_csv(adresse)
+            if not essai.empty:
+                df = essai
+                break
+        except Exception as erreur:
+            echecs.append(type(erreur).__name__)
+
+    if df is None or df.empty:
+        raise ValueError(
+            "Feuille de surveillance inaccessible. Vérifie qu'elle est publiée "
+            "(Fichier → Partager → Publier sur le web, format CSV). "
+            f"Tentatives : {', '.join(echecs)}"
+        )
+
+    colonne = df.columns[0]
+    for candidate in df.columns:
+        if _sans_accents(str(candidate)) in ("ticker", "symbole", "symbol",
+                                             "valeur", "code"):
+            colonne = candidate
+            break
+
+    tickers = []
+    for valeur in df[colonne].dropna():
+        ticker = str(valeur).strip().upper()
+        if ticker and ticker not in ("NAN", "TICKER", "SYMBOLE", "VALEUR"):
+            tickers.append(ticker)
+    return list(dict.fromkeys(tickers))
+
+
+MODELE_SURVEILLANCE = pd.DataFrame({
+    "Ticker": ["AAPL", "NVDA", "ASML.AS", "MC.PA", "TTE.PA"],
+    "Note": ["Détenue", "Semi-conducteurs", "Équipementier", "Luxe", "Énergie"],
 })
