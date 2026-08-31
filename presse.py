@@ -270,7 +270,7 @@ def selectionner(articles: list[dict], cle: str = "",
     Sans clé ou en cas d'échec, on retombe sur le classement par note, qui
     reste exploitable.
     """
-    cle = cle or os.environ.get("CLE_ANTHROPIC", "")
+    cle = (cle or os.environ.get("CLE_ANTHROPIC", "")).strip()
     if not cle or len(articles) < 3:
         return articles[:3]
 

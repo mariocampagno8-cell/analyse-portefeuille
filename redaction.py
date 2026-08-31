@@ -126,6 +126,9 @@ def _client(cle: str):
     explicite que l'appelant remonte.
     """
     import anthropic
+    # Un secret colle avec un retour a la ligne final produit une en-tete HTTP
+    # invalide et fait echouer tous les appels. On nettoie donc toujours.
+    cle = str(cle).strip()
     espace = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
     entetes = {"anthropic-workspace-id": espace} if espace else None
     return anthropic.Anthropic(api_key=cle, default_headers=entetes)
@@ -218,8 +221,12 @@ def _expliquer(erreur: Exception) -> None:
     elif nom == "AuthenticationError" or "401" in detail:
         print("   → Clé invalide, révoquée ou mal recopiée.")
     elif nom == "APIConnectionError":
-        print("   → Échec réseau vers api.anthropic.com. Vérifie que le paquet "
-              "`anthropic` est bien installé et que la clé n'est pas vide.")
+        if cause and "Illegal header value" in str(cause):
+            print("   → Le secret CLE_ANTHROPIC contient un espace ou un retour "
+                  "à la ligne. Recolle-le sans saut de ligne final.")
+        else:
+            print("   → Échec réseau vers api.anthropic.com. Vérifie que le "
+                  "paquet `anthropic` est installé et que la clé n'est pas vide.")
     elif "credit" in detail.lower() or "balance" in detail.lower():
         print("   → Crédit épuisé sur le compte Anthropic.")
     print("   Les commentaires standard prennent le relais.")
@@ -233,7 +240,7 @@ def enrichir(alertes: list[dict], contextes: dict[str, dict],
     Sans cle, ou en cas d'echec de l'appel, les commentaires d'origine sont
     conserves : l'outil continue de fonctionner, simplement en moins fin.
     """
-    cle = cle or os.environ.get("CLE_ANTHROPIC", "")
+    cle = (cle or os.environ.get("CLE_ANTHROPIC", "")).strip()
     if not cle or not alertes:
         return alertes
 
