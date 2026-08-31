@@ -583,6 +583,11 @@ def principal() -> int:
     envois = notifier(nouvelles)
     print(f"{envois} notification(s) envoyée(s).")
 
+    if envois == 0:
+        print("Aucun envoi réussi : les alertes ne sont pas mémorisées, "
+              "elles seront réessayées au prochain passage.", file=sys.stderr)
+        return 1
+
     maintenant = datetime.now(timezone.utc).isoformat()
     for alerte in nouvelles:
         etat[alerte["id"]] = maintenant

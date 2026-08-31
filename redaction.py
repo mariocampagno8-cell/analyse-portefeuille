@@ -112,8 +112,18 @@ def _ecrire_cache(cache: dict) -> None:
 # ==========================================================================
 
 def _client(cle: str):
+    """
+    Client Anthropic.
+
+    Une cle « liee a une identite » exige un en-tete precisant l'espace de
+    travail dans lequel elle agit. On le transmet quand la variable
+    ANTHROPIC_WORKSPACE_ID est definie ; sinon l'appel echoue avec un message
+    explicite que l'appelant remonte.
+    """
     import anthropic
-    return anthropic.Anthropic(api_key=cle)
+    espace = os.environ.get("ANTHROPIC_WORKSPACE_ID", "").strip()
+    entetes = {"anthropic-workspace-id": espace} if espace else None
+    return anthropic.Anthropic(api_key=cle, default_headers=entetes)
 
 
 def rediger(societe: dict, signaux: list[dict], cle: str,
@@ -163,6 +173,11 @@ def rediger(societe: dict, signaux: list[dict], cle: str,
     except Exception as erreur:
         detail = str(erreur)[:400]
         print(f"Rédaction IA indisponible — {type(erreur).__name__} : {detail}")
+        if "workspace-id" in detail:
+            print("→ Ta clé est liée à une identité. Deux solutions : créer une "
+                  "clé API standard sur console.anthropic.com, ou ajouter un "
+                  "secret ANTHROPIC_WORKSPACE_ID avec l'identifiant de ton "
+                  "espace de travail.")
         print("Les commentaires standard prennent le relais.")
         return {}
 
