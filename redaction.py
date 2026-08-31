@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 FICHIER_CACHE = Path(__file__).parent / "cache_commentaires.json"
@@ -156,30 +157,68 @@ def rediger(societe: dict, signaux: list[dict], cle: str,
         + ".\n\nRéponds uniquement par le JSON demandé."
     )
 
+    # Les erreurs réseau sont fréquentes et souvent passagères : on réessaie
+    # deux fois, avec une attente croissante, avant de renoncer.
+    passagères = ("APIConnectionError", "APITimeoutError", "RateLimitError",
+                  "InternalServerError", "OverloadedError")
+    reponse = None
+    for tentative in range(3):
+        try:
+            reponse = _client(cle).messages.create(
+                model=modele, max_tokens=1500, system=CONSIGNES,
+                messages=[{"role": "user", "content": message}],
+            )
+            break
+        except Exception as erreur:
+            nom = type(erreur).__name__
+            if nom in passagères and tentative < 2:
+                print(f"   {nom}, nouvelle tentative dans "
+                      f"{2 ** tentative} s…")
+                time.sleep(2 ** tentative)
+                continue
+            _expliquer(erreur)
+            return {}
+
+    if reponse is None:
+        return {}
+
     try:
-        reponse = _client(cle).messages.create(
-            model=modele, max_tokens=1500, system=CONSIGNES,
-            messages=[{"role": "user", "content": message}],
-        )
         texte = "".join(bloc.text for bloc in reponse.content
                         if getattr(bloc, "type", "") == "text").strip()
         texte = texte.removeprefix("```json").removeprefix("```").removesuffix("```")
         commentaires = json.loads(texte.strip())
         if not isinstance(commentaires, dict):
+            print("   Réponse inattendue du modèle, commentaires standard retenus.")
             return {}
         cache[empreinte] = commentaires
         _ecrire_cache(cache)
         return commentaires
-    except Exception as erreur:
-        detail = str(erreur)[:400]
-        print(f"Rédaction IA indisponible — {type(erreur).__name__} : {detail}")
-        if "workspace-id" in detail:
-            print("→ Ta clé est liée à une identité. Deux solutions : créer une "
-                  "clé API standard sur console.anthropic.com, ou ajouter un "
-                  "secret ANTHROPIC_WORKSPACE_ID avec l'identifiant de ton "
-                  "espace de travail.")
-        print("Les commentaires standard prennent le relais.")
+    except json.JSONDecodeError:
+        print("   Le modèle n'a pas renvoyé de JSON exploitable.")
         return {}
+
+
+def _expliquer(erreur: Exception) -> None:
+    """Affiche la cause d'un échec d'appel, et la piste de correction."""
+    nom = type(erreur).__name__
+    detail = str(erreur)[:400]
+    print(f"Rédaction IA indisponible — {nom} : {detail}")
+
+    cause = getattr(erreur, "__cause__", None)
+    if cause:
+        print(f"   cause sous-jacente : {type(cause).__name__} — {str(cause)[:250]}")
+
+    if "workspace-id" in detail:
+        print("   → Clé liée à une identité. Crée une clé dont la Portée est "
+              "un espace de travail (Default), pas « identique au compte lié ».")
+    elif nom == "AuthenticationError" or "401" in detail:
+        print("   → Clé invalide, révoquée ou mal recopiée.")
+    elif nom == "APIConnectionError":
+        print("   → Échec réseau vers api.anthropic.com. Vérifie que le paquet "
+              "`anthropic` est bien installé et que la clé n'est pas vide.")
+    elif "credit" in detail.lower() or "balance" in detail.lower():
+        print("   → Crédit épuisé sur le compte Anthropic.")
+    print("   Les commentaires standard prennent le relais.")
 
 
 def enrichir(alertes: list[dict], contextes: dict[str, dict],
