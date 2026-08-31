@@ -1,0 +1,27 @@
+name: Bilan hebdomadaire
+
+# Vendredi soir, après la clôture. Le seul message qui prend du recul.
+
+on:
+  schedule:
+    - cron: "30 16 * * 5"      # Vendredi 18h30 Paris
+  workflow_dispatch:
+
+jobs:
+  bilan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install yfinance pandas numpy requests
+      - name: Bilan de la semaine
+        env:
+          URL_FEUILLE: ${{ secrets.URL_FEUILLE }}
+          TELEGRAM_JETON: ${{ secrets.TELEGRAM_JETON }}
+          TELEGRAM_DESTINATAIRE: ${{ secrets.TELEGRAM_DESTINATAIRE }}
+          INDICE_REFERENCE: ${{ secrets.INDICE_REFERENCE }}
+        run: python bilan_semaine.py
