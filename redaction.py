@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 
 FICHIER_CACHE = Path(__file__).parent / "cache_commentaires.json"
-MODELE_DEFAUT = "claude-sonnet-5"
+MODELE_DEFAUT = os.environ.get("MODELE_CLAUDE", "claude-sonnet-5")
 
 CONSIGNES = """Tu rédiges des alertes pour un investisseur particulier français \
 qui suit son portefeuille avec un outil quantitatif. Il connaît les bases : \
@@ -161,8 +161,9 @@ def rediger(societe: dict, signaux: list[dict], cle: str,
         _ecrire_cache(cache)
         return commentaires
     except Exception as erreur:
-        print(f"Rédaction IA indisponible ({type(erreur).__name__}) — "
-              f"retour aux commentaires standard.")
+        detail = str(erreur)[:400]
+        print(f"Rédaction IA indisponible — {type(erreur).__name__} : {detail}")
+        print("Les commentaires standard prennent le relais.")
         return {}
 
 

@@ -379,33 +379,50 @@ def envoyer_ntfy(titre: str, corps: str, sujet: str,
 
 
 def envoyer_telegram(message: str, jeton: str, destinataire: str) -> bool:
-    """Notification via un bot Telegram. Mise en forme plus riche que ntfy."""
+    """
+    Notification via un bot Telegram.
+
+    Envoi en texte brut : le Markdown de Telegram echoue des qu'un asterisque
+    ou un tiret bas n'est pas apparie, ce qui arrive constamment dans un
+    commentaire redige librement. La mise en forme ne vaut pas le risque de
+    perdre le message.
+    """
+    if not jeton or not destinataire:
+        print("Telegram : jeton ou destinataire manquant.", file=sys.stderr)
+        return False
     try:
         reponse = requests.post(
             f"https://api.telegram.org/bot{jeton}/sendMessage",
-            json={"chat_id": destinataire, "text": message,
-                  "parse_mode": "Markdown",
+            json={"chat_id": str(destinataire).strip(), "text": message,
                   "disable_web_page_preview": True},
-            timeout=15,
+            timeout=20,
         )
-        return reponse.ok
+        if not reponse.ok:
+            print(f"Telegram a refusé la requête (code {reponse.status_code}) : "
+                  f"{reponse.text[:300]}", file=sys.stderr)
+            return False
+        return True
     except Exception as erreur:
-        print(f"Échec Telegram : {erreur}", file=sys.stderr)
+        print(f"Échec Telegram : {type(erreur).__name__} — {erreur}",
+              file=sys.stderr)
         return False
 
 
 def notifier(alertes: list[dict]) -> int:
     """Envoie les alertes par les canaux configures. Renvoie le nombre d'envois."""
-    sujet_ntfy = os.environ.get("NTFY_SUJET", "")
-    jeton_tg = os.environ.get("TELEGRAM_JETON", "")
-    dest_tg = os.environ.get("TELEGRAM_DESTINATAIRE", "")
+    sujet_ntfy = os.environ.get("NTFY_SUJET", "").strip()
+    jeton_tg = os.environ.get("TELEGRAM_JETON", "").strip()
+    dest_tg = os.environ.get("TELEGRAM_DESTINATAIRE", "").strip()
     envois = 0
+
+    print(f"Canaux — Telegram : {'configuré' if jeton_tg and dest_tg else 'absent'}"
+          f" | ntfy : {'configuré' if sujet_ntfy else 'absent'}")
 
     if jeton_tg and dest_tg:
         # Telegram limite un message à 4096 caractères : on découpe si besoin
-        blocs, courant = [], "📊 *Veille portefeuille*\n"
+        blocs, courant = [], "📊 VEILLE PORTEFEUILLE\n"
         for a in alertes:
-            morceau = f"\n*{a['titre']}*\n{a['corps']}\n"
+            morceau = f"\n▸ {a['titre']}\n{a['corps']}\n"
             if len(courant) + len(morceau) > 3800:
                 blocs.append(courant)
                 courant = morceau
