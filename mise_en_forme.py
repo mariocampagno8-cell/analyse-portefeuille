@@ -73,12 +73,20 @@ def lien(url: str, libelle: str) -> str:
     return f'<a href="{echapper(url)}">{echapper(libelle)}</a>'
 
 
-def bandeau(genre: str, complement: str = "") -> str:
-    """Ligne d'en-tete identifiant la nature du message."""
+def bandeau(genre: str, complement: str = "", detenue: bool = False) -> str:
+    """
+    Ligne d'en-tete identifiant la nature du message.
+
+    Le marqueur de detention compte : une publication sur une ligne detenue
+    appelle une decision, la meme sur une valeur simplement suivie n'appelle
+    qu'une lecture.
+    """
     emoji, libelle = BANDEAUX.get(genre, ("•", genre.upper()))
     texte = f"{emoji} {libelle}"
     if complement:
         texte += f" · {complement}"
+    if detenue:
+        texte += " · 💼 EN PORTEFEUILLE"
     return f"<b>{texte}</b>"
 
 
@@ -102,7 +110,8 @@ def assembler(*blocs: str) -> str:
 # ==========================================================================
 
 def message_signal(titre: str, corps: str, ticker: str = "",
-                   surveille: bool = False, chiffres: dict | None = None) -> str:
+                   surveille: bool = False, chiffres: dict | None = None,
+                   dates: dict | None = None) -> str:
     """
     Alerte sur une valeur.
 
@@ -123,7 +132,13 @@ def message_signal(titre: str, corps: str, ticker: str = "",
         if propres:
             bloc_chiffres = FILET + "\n" + "\n".join(propres)
 
-    return assembler(entete, ligne_titre, texte, bloc_chiffres,
+    bloc_dates = ""
+    if dates:
+        propres = [f"{echapper(k)} : {gras(v)}" for k, v in dates.items() if v]
+        if propres:
+            bloc_dates = "🗓 " + gras("Publications") + "\n" + "\n".join(propres)
+
+    return assembler(entete, ligne_titre, texte, bloc_chiffres, bloc_dates,
                      pied("Portefeuille" if not surveille else "Surveillance"))
 
 

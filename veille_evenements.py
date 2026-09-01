@@ -49,7 +49,7 @@ def envoyer(message: str) -> bool:
 
 
 def message_publication(publication: dict, attentes: dict | None = None,
-                        nom: str = "") -> str:
+                        nom: str = "", detenue: bool = False) -> str:
     """
     Annonce d'une publication a venir, avec ce que le marche attend.
 
@@ -100,7 +100,7 @@ def message_publication(publication: dict, attentes: dict | None = None,
 
     analystes = attentes.get("bpa_analystes") or attentes.get("ca_analystes")
 
-    blocs = [mf.bandeau("echeance", publication["ticker"]),
+    blocs = [mf.bandeau("echeance", publication["ticker"], detenue),
              mf.gras(publication["date"].strftime("%d/%m/%Y")),
              mf.echapper(" ".join(lignes))]
 
@@ -120,7 +120,8 @@ def message_publication(publication: dict, attentes: dict | None = None,
 
 def message_resultat(resultat: dict, publie: dict | None = None,
                      attendu: dict | None = None, ecarts: dict | None = None,
-                     lecture: str = "", nom: str = "") -> str:
+                     lecture: str = "", nom: str = "",
+                     detenue: bool = False) -> str:
     """Resultats publies : les chiffres, les ecarts, puis la lecture."""
     publie, attendu, ecarts = publie or {}, attendu or {}, ecarts or {}
     devise = attendu.get("devise", "")
@@ -161,7 +162,7 @@ def message_resultat(resultat: dict, publie: dict | None = None,
         chiffres.append("Marge opérationnelle : "
                         f"{publie['marge_operationnelle_pct']:.1f} %")
 
-    blocs = [mf.bandeau("signal", resultat["ticker"]),
+    blocs = [mf.bandeau("signal", resultat["ticker"], detenue),
              mf.gras(titre),
              mf.echapper(f"Publié le {resultat['date'].strftime('%d/%m/%Y')}.")]
 
@@ -177,7 +178,7 @@ def message_resultat(resultat: dict, publie: dict | None = None,
     return mf.assembler(*blocs)
 
 
-def message_revision(revision: dict) -> str:
+def message_revision(revision: dict, detenue: bool = False) -> str:
     """Revision : periode concernee et ampleur, sans interpretation."""
     periodes = {"0q": "trimestre en cours", "0y": "exercice en cours",
                 "+1y": "exercice prochain", "+1q": "trimestre prochain"}
@@ -185,7 +186,7 @@ def message_revision(revision: dict) -> str:
     sens = "relevée" if revision["variation_pct"] > 0 else "abaissée"
 
     return mf.assembler(
-        mf.bandeau("signal", revision["ticker"]),
+        mf.bandeau("signal", revision["ticker"], detenue),
         mf.gras(f"Prévision {sens} de "
                 f"{abs(revision['variation_pct']):.1f} % sur un mois"),
         mf.echapper(f"Estimation de bénéfice pour l'{periode} : "
@@ -193,12 +194,12 @@ def message_revision(revision: dict) -> str:
         mf.italique("Source : consensus des analystes, via Yahoo Finance"))
 
 
-def message_actualite(article: dict) -> str:
+def message_actualite(article: dict, detenue: bool = False) -> str:
     """Depeche : date et heure, source, puis l'information."""
     horodatage = (article["date"].strftime("%d/%m/%Y à %H:%M")
                   if article.get("date") else "")
 
-    blocs = [mf.bandeau("presse", article["ticker"])]
+    blocs = [mf.bandeau("presse", article["ticker"], detenue)]
     if horodatage:
         blocs.append(mf.gras(horodatage))
     blocs.append(mf.lien(article["lien"], article["titre"])
@@ -209,6 +210,7 @@ def message_actualite(article: dict) -> str:
 
 def principal() -> int:
     tickers = ev.charger_liste()
+    detenues = ev.charger_detenues()
     if not tickers:
         print("Aucune valeur à surveiller. Renseigne TICKERS_SURVEILLANCE.",
               file=sys.stderr)
@@ -234,6 +236,12 @@ def principal() -> int:
         + [{"type": "revision", "donnees": r} for r in resultat["revisions"]]
         + [{"type": "actualite", "donnees": a} for a in resultat["actualites"]])
 
+    # À type d'événement égal, une position détenue passe devant
+    rang = {"resultat": 0, "publication": 1, "revision": 2, "actualite": 3}
+    evenements.sort(key=lambda e: (
+        rang.get(e["type"], 9),
+        0 if e["donnees"].get("ticker") in detenues else 1))
+
     nouveaux = ev.filtrer_nouveaux([e["donnees"] for e in evenements])
     cles_nouvelles = {id(n) for n in nouveaux}
     evenements = [e for e in evenements if id(e["donnees"]) in cles_nouvelles]
@@ -248,11 +256,13 @@ def principal() -> int:
     for evenement in evenements:
         donnees = evenement["donnees"]
         genre = evenement["type"]
+        est_detenue = donnees.get("ticker") in detenues
 
         if genre == "publication":
             # Consensus complet : chiffre d'affaires, bénéfice, marge implicite
             attentes = pu.consensus(donnees["ticker"])
-            message = message_publication(donnees, attentes)
+            message = message_publication(donnees, attentes,
+                                          detenue=est_detenue)
 
         elif genre == "resultat":
             ticker = donnees["ticker"]
@@ -263,12 +273,13 @@ def principal() -> int:
                       if a["ticker"] == ticker][:5]
             lecture = pu.rediger_lecture(ticker, ticker, publie, attendu,
                                          ecarts, titres)
-            message = message_resultat(donnees, publie, attendu, ecarts, lecture)
+            message = message_resultat(donnees, publie, attendu, ecarts,
+                                       lecture, detenue=est_detenue)
 
         elif genre == "revision":
-            message = message_revision(donnees)
+            message = message_revision(donnees, est_detenue)
         else:
-            message = message_actualite(donnees)
+            message = message_actualite(donnees, est_detenue)
         if envoyer(message):
             envois += 1
             import time

@@ -423,3 +423,16 @@ def charger_liste(inclure_portefeuille: bool = True) -> list[str]:
                       file=sys.stderr)
 
     return list(dict.fromkeys(detenues + tickers))
+
+
+def charger_detenues() -> set[str]:
+    """Positions reellement detenues, pour distinguer suivi et detention."""
+    url = os.environ.get("URL_FEUILLE", "").strip()
+    if not url:
+        return set()
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import feuille as fe
+        return set(fe.lire(url)["Ticker"])
+    except Exception:
+        return set()
