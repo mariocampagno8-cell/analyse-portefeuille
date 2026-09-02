@@ -26,6 +26,7 @@ import fondamentaux as fo
 import indicateurs as ind
 import macro as mc
 import optimisation as opt
+import portefeuille as pf
 import previsions as pv
 import qualite as ql
 import univers as univ
@@ -425,6 +426,182 @@ with onglets[0]:
         nom_indice: an.courbe_drawdown(rdt_bench.reindex(rdt_ptf.index).fillna(0)) * 100,
     })
     st.area_chart(dd, height=260)
+
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("Diagnostic")
+    st.caption(
+        "Ce qui mérite ton attention, classé par gravité. Chaque constat "
+        "porte une action possible — un diagnostic sans action n'est qu'un "
+        "commentaire."
+    )
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def secteurs_des_lignes(tickers: tuple[str, ...]) -> dict:
+        """Secteur de chaque valeur. Cache 24 h."""
+        sortie = {}
+        for t in tickers:
+            try:
+                sortie[t] = dict(yf.Ticker(t).info).get("sector") or "Inconnu"
+            except Exception:
+                sortie[t] = "Inconnu"
+        return sortie
+
+    decompo_risque = an.decomposition_risque(poids, cov)
+    correlations = rdt.corr()
+    lignes_eff = an.nombre_effectif_lignes(poids)
+    conditionnel = an.beta_conditionnel(rdt_ptf, rdt_bench)
+
+    with st.spinner("Analyse en cours…"):
+        secteurs = secteurs_des_lignes(tuple(val.index))
+
+    constats = pf.diagnostiquer(
+        val, decompo_risque, correlations, lignes_eff,
+        beta=reg.get("beta"), beta_baissier=conditionnel.get("beta_baisse"),
+        secteurs=secteurs)
+
+    if not constats:
+        st.success("Aucun déséquilibre notable détecté.")
+    else:
+        couleurs = {"élevée": "error", "moyenne": "warning", "faible": "info"}
+        for constat in constats:
+            with st.container(border=True):
+                gauche, droite = st.columns([1, 5])
+                gauche.markdown(f"**{constat['sujet']}**")
+                gauche.caption(constat["gravite"].capitalize())
+                droite.markdown(f"**{constat['constat']}**")
+                droite.caption(constat["portee"])
+                droite.markdown(f"→ {constat['action']}")
+
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("Performance : le titre ou le change ?")
+    st.caption(
+        "Une ligne américaine qui gagne 20 % en dollars pendant que l'euro "
+        "s'apprécie de 8 % ne rapporte que 11 %. Confondre les deux fait "
+        "prendre un pari de change pour une réussite de sélection."
+    )
+
+    decompo_perf = pf.decomposer_performance(val)
+    colonnes_perf = ["Devise", "PRU", "Cours", "Perf titre (%)"]
+    st.dataframe(decompo_perf[colonnes_perf].round(2), use_container_width=True)
+    st.caption(
+        "La décomposition exacte demanderait le taux de change du jour de "
+        "chaque achat. Ajoute une colonne « Date d'achat » à ta feuille et je "
+        "pourrai la calculer — sans elle, la performance affichée mélange les "
+        "deux effets."
+    )
+
+    exp = pf.exposition(val, secteurs)
+    e1, e2 = st.columns(2)
+    with e1:
+        st.markdown("**Exposition par devise**")
+        st.dataframe(pd.Series(exp.get("devises", {}), name="%").round(1),
+                     use_container_width=True)
+    with e2:
+        st.markdown("**Exposition par secteur**")
+        st.dataframe(pd.Series(exp.get("secteurs", {}), name="%").round(1),
+                     use_container_width=True)
+
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("Que faire")
+
+    onglet_plan, onglet_apport = st.tabs(["Rééquilibrer", "Investir un apport"])
+
+    with onglet_plan:
+        st.caption(
+            "En France, un arbitrage sur compte-titres déclenche l'imposition "
+            "des plus-values. Le coût est immédiat et certain, le gain espéré "
+            "ne l'est pas : la comparaison décide."
+        )
+
+        methode = st.selectbox(
+            "Allocation cible",
+            ["Variance minimale", "Parité de risque", "HRP", "Équipondéré"],
+            key="cible_reequilibrage")
+
+        cov_robuste, _ = opt.covariance_retrecie(rdt, freq=freq)
+        cibles = {
+            "Variance minimale": lambda: opt.variance_minimale(cov_robuste),
+            "Parité de risque": lambda: opt.parite_de_risque(cov_robuste),
+            "HRP": lambda: opt.hrp(cov_robuste),
+            "Équipondéré": lambda: pd.Series(1 / len(cov_robuste),
+                                             index=cov_robuste.index),
+        }
+        try:
+            poids_cible = cibles[methode]()
+        except Exception as erreur:
+            st.error(f"Allocation non calculable : {erreur}")
+            poids_cible = pd.Series(dtype=float)
+
+        if not poids_cible.empty:
+            f1, f2 = st.columns(2)
+            taux_fiscal = f1.slider("Taux d'imposition (%)", 0, 40, 30,
+                                    help="Prélèvement forfaitaire unique par "
+                                         "défaut. Mets 0 pour un PEA.") / 100
+            frais_courtier = f2.slider("Frais par ordre (%)", 0.0, 2.0, 0.5,
+                                       step=0.1) / 100
+
+            plan = pf.plan_reequilibrage(val, poids_cible,
+                                         taux_fiscal=taux_fiscal,
+                                         frais=frais_courtier)
+
+            vol_actuelle = an.volatilite_portefeuille(poids, cov_robuste) * 100
+            vol_cible = an.volatilite_portefeuille(poids_cible, cov_robuste) * 100
+            gain = max(vol_actuelle - vol_cible, 0) * 0.5   # approximation prudente
+
+            synthese = pf.resume_plan(plan, gain_attendu_pct=gain,
+                                      valeur_totale=float(total))
+
+            c = st.columns(4)
+            c[0].metric("Ordres", synthese.get("ordres", 0))
+            c[1].metric("Rotation", fmt(synthese.get("rotation_pct"), 0, " %"))
+            c[2].metric("Coût total",
+                        fmt(synthese.get("cout_total"), 0, f" {devise_base}"),
+                        fmt(synthese.get("cout_pct"), 2, " %"))
+            c[3].metric("Volatilité", fmt(vol_cible, 1, " %"),
+                        fmt(vol_cible - vol_actuelle, 1, " pt"))
+
+            if synthese.get("verdict"):
+                (st.warning if "ne pas rééquilibrer" in synthese["verdict"]
+                 else st.info)(synthese["verdict"])
+
+            st.dataframe(
+                plan[["Poids actuel (%)", "Poids cible (%)", "Écart (pt)",
+                      "Sens", "Montant", "Frais", "Impôt estimé",
+                      "Coût total"]].round(2),
+                use_container_width=True)
+            st.caption(
+                "Montants dans ta devise de référence. L'impôt est estimé au "
+                "prorata de la plus-value latente cédée ; il sera nul sur un "
+                "PEA ou en moins-value."
+            )
+
+    with onglet_apport:
+        st.caption(
+            "La méthode la plus efficace pour un particulier : atteindre la "
+            "même cible sans rien vendre, donc sans déclencher un centime "
+            "d'impôt. À privilégier tant que tu épargnes."
+        )
+        montant_apport = st.number_input(
+            f"Montant à investir ({devise_base})", min_value=0.0,
+            value=1000.0, step=100.0)
+
+        if montant_apport > 0 and not poids_cible.empty:
+            repartition = pf.apport_optimal(val, poids_cible, montant_apport)
+            if repartition.empty:
+                st.info("Le portefeuille est déjà proche de la cible : "
+                        "répartis l'apport au prorata des poids visés.")
+            else:
+                st.dataframe(
+                    repartition[["Valeur actuelle", "À acheter",
+                                 "Part de l'apport (%)"]].round(0),
+                    use_container_width=True)
+                st.success(
+                    f"Ces {montant_apport:,.0f} {devise_base} rapprochent le "
+                    "portefeuille de sa cible sans aucune vente."
+                    .replace(",", " "))
 
 
 with onglets[1]:
