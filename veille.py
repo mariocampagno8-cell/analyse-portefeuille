@@ -33,6 +33,10 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+import cycle as cy
+import officiel as of
+import resultats as rs
+
 
 # ==========================================================================
 # 1. RÉGLAGES
@@ -52,9 +56,17 @@ CONCURRENT = 5.0                # % — mouvement chez un pair
 MAX_SONORES = 4                 # push sonores par jour
 MAX_MESSAGES = 12               # messages par jour
 SILENCE_DEBUT, SILENCE_FIN = heure(21, 0), heure(7, 0)
+# Les sociétés américaines publient après la clôture, soit 22h heure de Paris.
+# Interdire toute notification à cette heure viderait le dispositif de son
+# intérêt : on autorise donc les dépôts officiels P1 dans cette fenêtre.
+FENETRE_PUBLICATIONS = (heure(21, 30), heure(23, 30))
 GROUPEMENT = 3                  # événements de même nature avant regroupement
 MEMOIRE_JOURS = 5               # anti-répétition
 FILS = 5                        # appels Yahoo en parallèle
+
+# Cycle de résultats : jours avant publication déclenchant chaque message
+JALONS = (15, 5, 1)
+JOURS_APRES_PUBLICATION = 2     # fenêtre du message enrichi
 
 ETAT = Path(__file__).parent / "etat_veille.json"
 ETIQUETTES = {"A": "Portefeuille", "B": "Candidat", "C": "Veille"}
@@ -72,6 +84,7 @@ SYNONYMES = {
     "prix_entree": ["prix entree", "prix d'entree", "prix cible", "cible"],
     "prix_sortie": ["prix sortie", "prix de sortie", "seuil vente", "stop"],
     "concurrents": ["concurrents", "peers", "comparables"],
+    "note": ["note", "commentaire", "kpi", "indicateur"],
 }
 
 
@@ -188,7 +201,8 @@ def lire_univers(url: str) -> pd.DataFrame:
             "ticker": ticker, "strate": strate, "quantite": quantite,
             "pru": _nombre(ligne.get("pru")), "prix_entree": entree,
             "prix_sortie": _nombre(ligne.get("prix_sortie")),
-            "concurrents": str(ligne.get("concurrents", "") or "").strip()})
+            "concurrents": str(ligne.get("concurrents", "") or "").strip(),
+            "note": str(ligne.get("note", "") or "").strip()})
     if reclassements:
         print(f"{len(reclassements)} reclassement(s) automatique(s) :")
         for motif in reclassements[:15]:
@@ -416,6 +430,148 @@ def detecter(univers: pd.DataFrame, cours: pd.DataFrame,
 
 
 # ==========================================================================
+# 3 bis. CYCLE DE RÉSULTATS ET SOURCES OFFICIELLES
+# ==========================================================================
+
+def alertes_cycle(univers: pd.DataFrame, cours: pd.DataFrame,
+                  publications: list[dict]) -> list[dict]:
+    """
+    Messages J-15, J-5 et J-1 sur les strates A et B.
+
+    A J-5, les revisions passent en tete : les analystes finalisent leurs
+    estimations dans les deux dernieres semaines, ce qui en fait le message
+    le plus informatif du cycle.
+    """
+    strates = dict(zip(univers["ticker"], univers["strate"]))
+    alertes = []
+
+    for publication in publications:
+        ticker = publication["ticker"]
+        strate = strates.get(ticker, "C")
+        jours = publication["jours"]
+        if strate == "C" or jours not in JALONS:
+            continue
+        # La strate B ne reçoit que J-10 et le jour J, pas le cycle complet
+        if strate == "B" and jours != 5:
+            continue
+
+        attendu = rs.consensus(ticker)
+        revisions = rs.revisions(ticker) if jours <= 15 else {}
+        historique = (rs.historique(ticker, cours.get(ticker))
+                      if jours >= 5 else {})
+        options = (rs.mouvement_implicite(ticker, publication["date"])
+                   if jours <= 5 else {})
+
+        performance = {}
+        if ticker in cours.columns:
+            prix = cours[ticker].dropna()
+            if len(prix) > 70:
+                for libelle, seances in [("perf_1m", 21), ("perf_3m", 63)]:
+                    performance[f"{libelle}_pct"] = float(
+                        prix.iloc[-1] / prix.iloc[-seances - 1] - 1) * 100
+
+        alertes.append({
+            "ticker": ticker, "strate": strate,
+            "priorite": "P1" if (strate == "A" and jours <= 5) else "P2",
+            "nature": f"cycle_j{jours}", "emoji": "📅",
+            "titre": f"Publication J-{jours}",
+            "message": cy.message_ouverture(
+                ticker, strate, publication["date"], jours, attendu,
+                revisions, historique, options, performance)})
+    return alertes
+
+
+def alertes_officielles(univers: pd.DataFrame) -> list[dict]:
+    """
+    Depots SEC recents, classes par code d'item.
+
+    C'est la seule source du systeme dont la latence se compte en minutes.
+    Les valeurs europeennes n'y figurent pas : EDGAR ne couvre que les
+    emetteurs americains.
+    """
+    strates = dict(zip(univers["ticker"], univers["strate"]))
+    alertes = []
+    americaines = [t for t in univers["ticker"] if cy.est_americaine(t)]
+    if not americaines:
+        return alertes
+
+    print(f"{len(americaines)} valeur(s) couverte(s) par EDGAR "
+          f"sur {len(univers)}.")
+
+    for ticker in americaines:
+        strate = strates.get(ticker, "C")
+        for depot in of.depots(ticker, jours=1):
+            # Strate C : uniquement l'exceptionnel
+            if strate == "C" and depot["priorite"] != "P1":
+                continue
+            if depot["priorite"] == "P3":
+                continue
+
+            if depot["formulaire"] == "8-K" and depot["item"] == "2.02":
+                message = cy.message_publication_immediate(
+                    depot, strate, rs.consensus(ticker))
+                nature = "resultats_publies"
+            else:
+                message = cy.message_communique(depot, strate)
+                nature = f"depot_{depot['item'] or depot['formulaire']}"
+
+            alertes.append({
+                "ticker": ticker, "strate": strate,
+                "priorite": depot["priorite"],
+                "sonore": depot["priorite"] == "P1" and strate in ("A", "B"),
+                "nature": nature, "emoji": "📊",
+                "titre": depot["libelle"], "message": message})
+    return alertes
+
+
+def alertes_resultats_enrichis(univers: pd.DataFrame) -> list[dict]:
+    """
+    Message du lendemain : chiffres publies, verdict de these, lecture.
+
+    Declenche quand Yahoo a mis a jour les comptes, un a trois jours apres la
+    publication. Explicitement etiquete source secondaire.
+    """
+    alertes = []
+    for _, ligne in univers[univers["strate"].isin(["A", "B"])].iterrows():
+        ticker = ligne["ticker"]
+        bpa = rs.dernier_bpa(ticker)
+        if not bpa or not (1 <= bpa.get("jours", 99) <= JOURS_APRES_PUBLICATION):
+            continue
+
+        publie = rs.chiffres_publies(ticker)
+        if not publie.get("ca"):
+            continue
+        attendu = rs.consensus(ticker)
+        regles = rs.analyser_these(ligne.get("note", ""))
+        verdicts = rs.verdict_these(regles, publie) if regles else []
+        lecture = rs.rediger(ticker, publie, attendu, verdicts)
+
+        alertes.append({
+            "ticker": ticker, "strate": ligne["strate"],
+            "priorite": "P1" if ligne["strate"] == "A" else "P2",
+            "nature": "chiffres_enrichis", "emoji": "📊",
+            "titre": "Chiffres et lecture",
+            "message": cy.message_chiffres(ticker, ligne["strate"], publie,
+                                           attendu, bpa, verdicts, lecture)})
+    return alertes
+
+
+def alertes_macro() -> list[dict]:
+    """Statistiques macroeconomiques inhabituelles."""
+    alertes = []
+    try:
+        for publication in of.macro_a_signaler(of.publications_macro(jours=1)):
+            alertes.append({
+                "ticker": "MACRO", "strate": "A", "priorite": "P1",
+                "nature": f"macro_{publication['code']}", "emoji": "🏛",
+                "titre": publication["libelle"],
+                "message": cy.message_macro(publication)})
+    except Exception as erreur:
+        print(f"Macro indisponible : {type(erreur).__name__}", file=sys.stderr)
+    return alertes
+
+
+# ==========================================================================
 # 4. BUDGET
 # ==========================================================================
 
@@ -439,6 +595,22 @@ def lire_etat() -> dict:
 def en_silence() -> bool:
     maintenant = datetime.now().time()
     return maintenant >= SILENCE_DEBUT or maintenant < SILENCE_FIN
+
+
+def _exception_silence(alerte: dict) -> bool:
+    """
+    Alertes autorisees pendant la plage de silence.
+
+    Deux cas : un P1 sur une ligne detenue, et un depot officiel de resultats
+    dans la fenetre ou les societes americaines publient. Le second est
+    indispensable — c'est precisement l'information que l'on attend le soir.
+    """
+    if alerte["priorite"] == "P1" and alerte["strate"] == "A":
+        return True
+    maintenant = datetime.now().time()
+    dans_fenetre = FENETRE_PUBLICATIONS[0] <= maintenant <= FENETRE_PUBLICATIONS[1]
+    return (dans_fenetre and alerte["nature"] == "resultats_publies"
+            and alerte["strate"] in ("A", "B"))
 
 
 def arbitrer(alertes: list[dict], etat: dict) -> dict:
@@ -476,7 +648,7 @@ def arbitrer(alertes: list[dict], etat: dict) -> dict:
             reportees.append({**a, "motif": "P3 — digest"})
         elif compte_m >= MAX_MESSAGES:
             reportees.append({**a, "motif": "plafond quotidien"})
-        elif en_silence() and not (a["priorite"] == "P1" and a["strate"] == "A"):
+        elif en_silence() and not _exception_silence(a):
             reportees.append({**a, "motif": "plage de silence"})
         else:
             # bool() explicite : `a.get("sonore")` vaut None quand la clé
@@ -514,6 +686,10 @@ def echapper(texte) -> str:
 
 def formater(a: dict) -> str:
     """Un message par alerte : titre, chiffres alignés, source."""
+    # Les alertes du cycle de résultats composent leur propre message,
+    # avec tableaux et sections : on ne le reformate pas.
+    if a.get("message"):
+        return a["message"]
     marque = " 💼" if a["strate"] == "A" else ""
     entete = (f"{a.get('emoji', '•')} <b>{echapper(a['ticker'])}{marque} — "
               f"{echapper(a['titre'])}</b>")
@@ -640,8 +816,27 @@ def principal() -> int:
             univers[univers["strate"].isin(["A", "B"])]["ticker"].tolist())
         print(f"{len(publications)} publication(s) au calendrier.")
 
+    # --- Alertes de prix et de risque, à chaque passage
     alertes = detecter(univers, cours, publications, mode)
-    print(f"{len(alertes)} alerte(s) détectée(s).")
+    print(f"{len(alertes)} alerte(s) de prix.")
+
+    # --- Cycle de résultats et macro, le matin
+    if mode == "matin":
+        cycle = alertes_cycle(univers, cours, publications)
+        macro = alertes_macro()
+        enrichis = alertes_resultats_enrichis(univers)
+        print(f"{len(cycle)} message(s) de cycle, {len(macro)} macro, "
+              f"{len(enrichis)} chiffres enrichis.")
+        alertes += cycle + macro + enrichis
+
+    # --- Dépôts officiels, à chaque passage : c'est la seule source dont la
+    #     latence se compte en minutes, elle ne doit pas attendre le matin.
+    if mode in ("seance", "soir", "matin"):
+        officielles = alertes_officielles(univers)
+        print(f"{len(officielles)} dépôt(s) officiel(s).")
+        alertes += officielles
+
+    print(f"{len(alertes)} alerte(s) au total.")
 
     etat = lire_etat()
     arbitrage = arbitrer(alertes, etat)
