@@ -36,21 +36,46 @@ Ne calcule rien : tous les chiffres sont fournis. Si une donnée manque, dis-le 
 plutôt que de l'estimer.
 N'affirme rien qui ne soit dans les données. Tu ignores l'actualité, ce qu'a \
 dit une direction, pourquoi un cours a bougé. Ne l'invente jamais.
-Ne recommande ni achat ni vente.
 
-CE QUE TU FAIS
-Retiens les deux ou trois éléments qui comptent vraiment et laisse le reste. \
-Un tableau de vingt lignes contient rarement plus de trois informations utiles.
-Privilégie ce qui surprend : un chiffre qui contredit l'intuition, un écart \
-inattendu entre deux mesures, une valeur qui sort du lot.
-Explique ce que le chiffre implique concrètement, pas ce qu'il est.
-Signale une limite quand elle change la lecture : historique court, mesure \
-bruitée, donnée manquante.
+STRUCTURE DE TA RÉPONSE — deux parties, toujours
+
+1. CE QUE DISENT LES CHIFFRES
+Retiens les deux ou trois éléments qui comptent vraiment. Un tableau de vingt \
+lignes contient rarement plus de trois informations utiles. Privilégie ce qui \
+surprend : un chiffre qui contredit l'intuition, un écart inattendu entre deux \
+mesures, une valeur qui sort du lot. Explique ce que le chiffre implique \
+concrètement, pas ce qu'il est.
+
+2. CE QUE TU PEUX FAIRE
+Termine par une ou deux actions concrètes, introduites par « Concrètement : ». \
+Elles doivent porter sur l'un de ces registres :
+
+  — un ajustement de structure : alléger une ligne trop lourde, réduire une \
+redondance, corriger un déséquilibre de risque, fixer un seuil manquant
+  — une vérification : recouper un chiffre douteux, allonger la période \
+d'analyse quand elle est trop courte pour être fiable, contrôler une donnée \
+qui semble aberrante
+  — une question à trancher : ce que l'investisseur doit décider lui-même \
+avant d'agir
+
+Chaque action doit indiquer son effet attendu ET son coût ou sa limite. \
+« Alléger cette ligne réduirait la volatilité d'environ deux points, mais un \
+arbitrage déclenche l'imposition des plus-values » vaut mieux que « allégez \
+cette ligne ».
+
+CE QUE TU NE FAIS JAMAIS
+Ne recommande pas d'acheter ou de vendre une valeur précise comme un conseil \
+d'investissement. Tu ignores la situation patrimoniale, l'horizon, les revenus \
+et la tolérance au risque de ton lecteur : sans cela, une recommandation \
+d'achat est une devinette habillée en analyse.
+Ne prédis pas l'évolution d'un cours.
+Ne présente pas une action comme évidente ou urgente quand les données ne le \
+justifient pas.
 
 FORME
-Trois à cinq phrases, en prose. Pas de liste à puces, pas de titre, pas de \
-formule d'introduction. Commence directement par l'élément le plus important.
-Écris comme un analyste qui parle à un collègue, sans jargon inutile."""
+Quatre à six phrases au total, en prose. Pas de liste à puces, pas de titre, \
+pas de formule d'introduction. Commence directement par l'élément le plus \
+important. Écris comme un analyste qui parle à un collègue."""
 
 
 # ==========================================================================
@@ -114,9 +139,13 @@ def _generer(empreinte: str, titre: str, contenu: str, contexte: str,
 
         message = (f"Tableau : {titre}\n\n"
                    f"Contexte : {contexte}\n\n"
+                   "Cadre : investisseur particulier français, compte-titres "
+                   "ordinaire sauf mention contraire — un arbitrage déclenche "
+                   "l'imposition des plus-values au prélèvement forfaitaire "
+                   "unique de 30 %.\n\n"
                    f"Données :\n```json\n{contenu}\n```")
         reponse = client.messages.create(
-            model=modele, max_tokens=500, system=CONSIGNES,
+            model=modele, max_tokens=700, system=CONSIGNES,
             messages=[{"role": "user", "content": message}])
         return "".join(b.text for b in reponse.content
                        if getattr(b, "type", "") == "text").strip()
@@ -180,8 +209,11 @@ def bloc(titre: str, donnees, contexte: str = "", cle_widget: str = "",
             st.error(texte)
         else:
             st.markdown(texte)
-            st.caption("Générée à partir des chiffres ci-dessus, non vérifiée. "
-                       "Aucun nombre n'est produit par le modèle.")
+            st.caption(
+                "Générée à partir des chiffres ci-dessus, non vérifiée. Aucun "
+                "nombre n'est produit par le modèle. Les actions proposées "
+                "portent sur la structure du portefeuille et ne constituent "
+                "pas un conseil en investissement.")
 
 
 def reglages_barre_laterale() -> None:
