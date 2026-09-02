@@ -19,6 +19,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 import acces as ac
+import analyse as ia
 import analytics as an
 import assistant as asst
 import feuille as fe
@@ -164,6 +165,8 @@ seuil_var = st.sidebar.select_slider(
     "Seuil de VaR", options=[0.01, 0.05, 0.10], value=0.05,
     format_func=lambda v: f"{int((1 - v) * 100)} %",
 )
+
+ia.reglages_barre_laterale()
 
 st.sidebar.divider()
 st.sidebar.subheader("Source du portefeuille")
@@ -386,6 +389,10 @@ with onglets[0]:
             "Plus-value": f"Plus-value ({devise_base})",
         })
         st.dataframe(affichage_lignes.round(2), use_container_width=True)
+        ia.bloc("Lignes du portefeuille", affichage_lignes,
+                f"Portefeuille de {len(val)} lignes, {total:,.0f} {devise_base} "
+                f"au total. Indice de référence : {nom_indice}.".replace(",", " "),
+                "lignes_ptf")
 
         devises_etrangeres = val[val["Devise"] != devise_base]
         if not devises_etrangeres.empty:
@@ -616,6 +623,10 @@ with onglets[1]:
         decompo.sort_values("Part du risque (%)", ascending=False).round(2),
         use_container_width=True,
     )
+    ia.bloc("Décomposition du risque", decompo,
+            "La contribution au risque ne suit presque jamais les poids. "
+            "L'écart entre les deux colonnes est l'information principale.",
+            "decompo_risque")
 
     e = st.columns(4)
     e[0].metric("Volatilité du portefeuille",
@@ -659,6 +670,10 @@ with onglets[1]:
         for i in synthese.index
     ]
     st.dataframe(synthese.round(3), use_container_width=True, height=640)
+    ia.bloc("Mesures de risque", synthese,
+            f"Portefeuille, {nom_indice} et chaque ligne, sur {periode}. "
+            "Bêta, alpha, Sharpe, VaR et bêta conditionnel.",
+            "mesures_risque")
 
     st.subheader(f"Perte extrême — VaR {int((1 - seuil_var) * 100)} %")
     v = st.columns(3)
@@ -695,6 +710,11 @@ with onglets[2]:
     fig.update_layout(height=120 + 52 * len(correl), coloraxis_showscale=False,
                       margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, use_container_width=True)
+
+    ia.bloc("Corrélations", correl,
+            "Corrélations entre les lignes et avec l'indice. Au-delà de 0,8, "
+            "deux lignes comptent pour une seule position.",
+            "correlations")
 
     st.subheader("Matrice de covariance annualisée")
     st.dataframe(cov.round(4), use_container_width=True)
@@ -781,8 +801,13 @@ with onglets[3]:
             "Écart au portefeuille actuel (%)":
                 float((w - allocations["Portefeuille actuel"]).abs().sum()) * 100 / 2,
         })
-    st.dataframe(pd.DataFrame(resume).set_index("Allocation").round(2),
-                 use_container_width=True)
+    tableau_allocations = pd.DataFrame(resume).set_index("Allocation").round(2)
+    st.dataframe(tableau_allocations, use_container_width=True)
+    ia.bloc("Comparaison des allocations", tableau_allocations,
+            "Rendement attendu, volatilité et Sharpe de chaque méthode, face "
+            "au portefeuille actuel. Le Sharpe attendu est très sensible aux "
+            "erreurs d'estimation des rendements.",
+            "allocations")
 
     st.subheader("Poids par allocation")
     tableau_poids = pd.DataFrame(allocations) * 100
@@ -971,11 +996,14 @@ with onglets[5]:
             courbes[nom_indice] = reference
             st.line_chart(pd.DataFrame(courbes), height=380)
 
-            st.dataframe(
-                pd.DataFrame(mesures).set_index("Méthode").round(2)
-                .sort_values("Sharpe", ascending=False),
-                use_container_width=True,
-            )
+            tableau_backtest = (pd.DataFrame(mesures).set_index("Méthode")
+                                .round(2).sort_values("Sharpe", ascending=False))
+            st.dataframe(tableau_backtest, use_container_width=True)
+            ia.bloc("Backtest walk-forward", tableau_backtest,
+                    "Chaque méthode réestimée à chaque rebalancement sur les "
+                    "seules données antérieures, coûts déduits. La rotation "
+                    "annuelle est décisive : elle paiera frais et impôts.",
+                    "backtest")
             st.caption(
                 "La colonne de rotation annuelle est décisive : une méthode qui "
                 "fait tourner 400 % du portefeuille par an paiera des frais et "
@@ -1228,6 +1256,11 @@ with onglets[8]:
         tri = st.selectbox("Trier par", list(scr.columns), index=3)
         st.dataframe(filtre.sort_values(tri, ascending=False).round(2),
                      use_container_width=True, height=520)
+        ia.bloc("Résultat du screener", filtre.sort_values(tri, ascending=False),
+                f"{len(filtre)} valeurs retenues sur {len(scr)} balayées. "
+                "Attention au biais de sélection : ces valeurs ont été "
+                "choisies en connaissant leur passé.",
+                "screener")
         st.caption(f"{len(filtre)} valeurs retenues sur {len(scr)}.")
 
         st.download_button("Exporter le screener (CSV)",
@@ -1384,6 +1417,10 @@ with onglets[10]:
         st.divider()
         st.markdown(f"**Compte de résultat** (en {unite.lower()})")
         st.dataframe(sans_doublons(cr / diviseur).round(2), use_container_width=True)
+        ia.bloc(f"Compte de résultat — {ticker_fo}", cr / diviseur,
+                f"Quatre exercices, en {unite.lower()}. "
+                f"Secteur : {info_fo.get('sector', 'inconnu')}.",
+                "compte_resultat")
 
         st.markdown("**Évolution des marges**")
         if not mg.empty:
@@ -1901,6 +1938,10 @@ with onglets[13]:
         tableau_qualite = ql.controler_univers(cours[list(val.index)])
 
     st.dataframe(tableau_qualite, use_container_width=True)
+    ia.bloc("Qualité des données", tableau_qualite,
+            "Score sur 100 mesurant l'absence d'anomalies détectables — "
+            "ce n'est pas une garantie d'exactitude.",
+            "qualite")
 
     douteux = tableau_qualite[tableau_qualite["Score"] < 65]
     if not douteux.empty:
@@ -2269,6 +2310,10 @@ with onglets[15]:
                        key="tri_surveillance")
     st.dataframe(tableau_surv.sort_values(tri, ascending=False).round(2),
                  use_container_width=True, height=560)
+    ia.bloc("Valeurs surveillées", tableau_surv.sort_values(tri, ascending=False),
+            f"{len(tableau_surv)} valeurs suivies hors portefeuille, sur "
+            f"{periode_surv}. Bêta mesuré contre {nom_indice}.",
+            "surveillance")
 
     st.download_button("Exporter (CSV)", tableau_surv.to_csv().encode("utf-8"),
                        "surveillance.csv", "text/csv")
