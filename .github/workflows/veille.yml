@@ -1,9 +1,10 @@
 name: Veille portefeuille
 
-# Trois moments, un seul fichier, un seul script.
-#   7h30           rappel J-1 des publications du lendemain
-#   9h45 / 14h15 / 17h30   alertes de prix et de risque
-#   vendredi 18h30 digest de la semaine
+# Cinq moments, un seul script.
+#   7h30    matin  : cycle J-15 / J-5 / J-1, macro, chiffres du lendemain
+#   9h45 / 14h15 / 17h30  séance : alertes de prix et dépôts officiels
+#   22h10   soir   : dépôts 8-K américains, l'heure des publications
+#   vendredi 18h30 : digest de la semaine
 #
 # Le budget — 4 push sonores, 12 messages, silence 21h-7h — est appliqué par
 # le code, pas par le planificateur.
@@ -14,6 +15,7 @@ on:
     - cron: "45 7 * * 1-5"
     - cron: "15 12 * * 1-5"
     - cron: "30 15 * * 1-5"
+    - cron: "10 20 * * 1-5"
     - cron: "30 16 * * 5"
   workflow_dispatch:
     inputs:
@@ -22,7 +24,7 @@ on:
         required: false
         default: "seance"
         type: choice
-        options: [seance, matin, digest]
+        options: [seance, matin, soir, digest]
 
 permissions:
   contents: write
@@ -39,7 +41,7 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install yfinance pandas numpy requests
+      - run: pip install yfinance pandas numpy requests anthropic
 
       - name: Déterminer le moment
         id: moment
@@ -50,6 +52,8 @@ jobs:
             echo "mode=matin" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event.schedule }}" == "30 16 * * 5" ]]; then
             echo "mode=digest" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "10 20 * * 1-5" ]]; then
+            echo "mode=soir" >> $GITHUB_OUTPUT
           else
             echo "mode=seance" >> $GITHUB_OUTPUT
           fi
@@ -59,6 +63,9 @@ jobs:
           URL_UNIVERS: ${{ secrets.URL_UNIVERS }}
           TELEGRAM_JETON: ${{ secrets.TELEGRAM_JETON }}
           TELEGRAM_DESTINATAIRE: ${{ secrets.TELEGRAM_DESTINATAIRE }}
+          CLE_ANTHROPIC: ${{ secrets.CLE_ANTHROPIC }}
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+          EDGAR_CONTACT: ${{ secrets.EDGAR_CONTACT }}
           MODE: ${{ steps.moment.outputs.mode }}
         run: python veille.py
 
