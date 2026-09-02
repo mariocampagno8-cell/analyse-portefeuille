@@ -1,0 +1,75 @@
+name: Veille portefeuille
+
+# Trois moments, un seul fichier, un seul script.
+#   7h30           rappel J-1 des publications du lendemain
+#   9h45 / 14h15 / 17h30   alertes de prix et de risque
+#   vendredi 18h30 digest de la semaine
+#
+# Le budget — 4 push sonores, 12 messages, silence 21h-7h — est appliqué par
+# le code, pas par le planificateur.
+
+on:
+  schedule:
+    - cron: "30 5 * * 1-5"
+    - cron: "45 7 * * 1-5"
+    - cron: "15 12 * * 1-5"
+    - cron: "30 15 * * 1-5"
+    - cron: "30 16 * * 5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode"
+        required: false
+        default: "seance"
+        type: choice
+        options: [seance, matin, digest]
+
+permissions:
+  contents: write
+
+jobs:
+  veille:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install yfinance pandas numpy requests
+
+      - name: Déterminer le moment
+        id: moment
+        run: |
+          if [[ -n "${{ inputs.mode }}" ]]; then
+            echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "30 5 * * 1-5" ]]; then
+            echo "mode=matin" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "30 16 * * 5" ]]; then
+            echo "mode=digest" >> $GITHUB_OUTPUT
+          else
+            echo "mode=seance" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Exécuter
+        env:
+          URL_UNIVERS: ${{ secrets.URL_UNIVERS }}
+          TELEGRAM_JETON: ${{ secrets.TELEGRAM_JETON }}
+          TELEGRAM_DESTINATAIRE: ${{ secrets.TELEGRAM_DESTINATAIRE }}
+          MODE: ${{ steps.moment.outputs.mode }}
+        run: python veille.py
+
+      - name: Mémoriser l'état
+        if: always()
+        run: |
+          if [[ -n $(git status --porcelain etat_veille.json) ]]; then
+            git config user.name "veille"
+            git config user.email "veille@users.noreply.github.com"
+            git add etat_veille.json
+            git commit -m "Veille : etat"
+            git pull --rebase --autostash || true
+            git push
+          fi
