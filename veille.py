@@ -1,29 +1,31 @@
 """
-Veille automatique et notifications.
+Veille de portefeuille — fichier unique.
 
-Script autonome, sans Streamlit : concu pour tourner sans personne devant
-l'ecran, typiquement une fois par jour via GitHub Actions.
+Tout le systeme tient ici, en six sections lisibles de haut en bas :
 
-Philosophie des alertes. Une alerte n'a d'interet que si elle appelle une
-decision que tu ne pouvais pas anticiper. Les signaux techniques n'en font
-generalement pas partie : ils se declenchent souvent, se contredisent, et leur
-effet documente est d'augmenter la frequence de transaction sans ameliorer le
-resultat. Les regles activees par defaut sont donc des regles d'ECHEANCE et de
-DERIVE, pas de signal. Les regles de signal existent mais sont desactivees.
+  1. REGLAGES   les seuils, rassembles en un seul endroit
+  2. UNIVERS    lecture de la feuille Google, strates A / B / C
+  3. ALERTES    franchissements de prix, mouvements, publications
+  4. BUDGET     plafonds, silence nocturne, anti-repetition
+  5. MESSAGES   mise en forme et envoi Telegram
+  6. EXECUTION  enchainement
 
-Anti-repetition : chaque alerte emise est memorisee dans etat_veille.json.
-Une meme alerte ne sera pas renvoyee avant le delai configure — sans quoi une
-position sous son seuil declencherait une notification chaque jour pendant
-des semaines.
+Principe directeur : une notification n'est envoyee que si elle peut declencher
+une action — acheter, vendre, alleger, renforcer. Le reste va au digest ou
+nulle part. Les jours ou il ne se passe rien, rien n'est envoye : c'est ce
+silence qui rend credibles les messages qui partent.
 """
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, time as heure, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -31,671 +33,612 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-import mise_en_forme as mf
-import redaction as rd
-import signaux as sg
 
-FICHIER_ETAT = Path(__file__).parent / "etat_veille.json"
-DELAI_REPETITION = 7          # jours avant de reemettre une meme alerte
+# ==========================================================================
+# 1. RÉGLAGES
+# ==========================================================================
+
+# Le mouvement de séance est calibré en écarts-types, jamais en pourcentage
+# fixe : 5 % est un événement sur Coca-Cola et une séance ordinaire sur IONQ.
+SIGMA = 2.5
+PLANCHER = 3.0                  # jamais d'alerte en deçà
+PLAFOND = 12.0                  # toujours une alerte au-delà
+
+PROXIMITE_ENTREE = 3.0          # % — approche du prix d'entrée (strate B)
+PROXIMITE_CIBLE = 10.0          # % — approche du prix cible (strate C)
+CONCENTRATION = 15.0            # % du portefeuille sur une seule ligne
+CONCURRENT = 5.0                # % — mouvement chez un pair
+
+MAX_SONORES = 4                 # push sonores par jour
+MAX_MESSAGES = 12               # messages par jour
+SILENCE_DEBUT, SILENCE_FIN = heure(21, 0), heure(7, 0)
+GROUPEMENT = 3                  # événements de même nature avant regroupement
+MEMOIRE_JOURS = 5               # anti-répétition
+FILS = 5                        # appels Yahoo en parallèle
+
+ETAT = Path(__file__).parent / "etat_veille.json"
+ETIQUETTES = {"A": "Portefeuille", "B": "Candidat", "C": "Veille"}
 
 
 # ==========================================================================
-# Configuration
+# 2. UNIVERS
 # ==========================================================================
 
-REGLES_DEFAUT = {
-    # --- Échéances : tu ne peux pas les deviner, elles appellent une action
-    "publication_proche": {
-        "actif": True, "jours": 3,
-        "libelle": "Publication de résultats imminente",
-    },
-    # --- Dérive : ton portefeuille ne ressemble plus à ce que tu voulais
-    "derive_poids": {
-        "actif": True, "seuil_points": 10,
-        "libelle": "Une position a fortement dérivé",
-    },
-    "concentration": {
-        "actif": True, "seuil_pct": 40,
-        "libelle": "Concentration excessive sur une ligne",
-    },
-    # --- Risque : le portefeuille sort de ta zone de tolérance
-    "drawdown_portefeuille": {
-        "actif": True, "seuil_pct": -15,
-        "libelle": "Repli du portefeuille au-delà du seuil",
-    },
-    "volatilite_anormale": {
-        "actif": True, "multiple": 2.0,
-        "libelle": "Volatilité très supérieure à sa normale",
-    },
-    # --- Qualité : un chiffre est devenu douteux
-    "donnees_perimees": {
-        "actif": True, "jours_ouvres": 5,
-        "libelle": "Cours non mis à jour",
-    },
-    # --- Signaux documentés (voir signaux.py pour les références)
-    "momentum": {
-        "actif": True,
-        "libelle": "Position au classement momentum",
-    },
-    "derive_resultats": {
-        "actif": True,
-        "libelle": "Dérive post-annonce de résultats",
-    },
-    "revisions": {
-        "actif": True,
-        "libelle": "Révision des estimations",
-    },
-    "plus_haut": {
-        "actif": True,
-        "libelle": "Position face au plus haut annuel",
-    },
-    "regime": {
-        "actif": True, "indice": "IWDA.AS",
-        "libelle": "Changement de régime de marché",
-    },
-    "dimensionnement": {
-        "actif": True,
-        "libelle": "Concentration du risque",
-    },
-
-    # --- Signaux techniques simples : désactivés, voir l'avertissement en tête
-    "rsi_bas": {
-        "actif": False, "seuil": 30,
-        "libelle": "RSI en zone basse",
-    },
-    "rsi_haut": {
-        "actif": False, "seuil": 70,
-        "libelle": "RSI en zone haute",
-    },
-    "franchissement_mm200": {
-        "actif": False,
-        "libelle": "Franchissement de la moyenne 200 séances",
-    },
-    "ecart_plus_haut": {
-        "actif": False, "seuil_pct": -25,
-        "libelle": "Écart important au plus haut annuel",
-    },
+SYNONYMES = {
+    "ticker": ["ticker", "symbole", "symbol", "code", "valeur"],
+    "strate": ["strate", "categorie", "type", "niveau"],
+    "quantite": ["quantite", "qte", "nombre", "titres", "quantity"],
+    "pru": ["pru", "prix d'achat", "prix dachat", "prix de revient"],
+    "prix_entree": ["prix entree", "prix d'entree", "prix cible", "cible"],
+    "prix_sortie": ["prix sortie", "prix de sortie", "seuil vente", "stop"],
+    "concurrents": ["concurrents", "peers", "comparables"],
 }
 
 
-def charger_config() -> dict:
-    """
-    Regles depuis la variable d'environnement REGLES_VEILLE, sinon defauts.
+def _propre(texte) -> str:
+    return str(texte).lower().strip().translate(
+        str.maketrans("àâäéèêëîïôöùûüç", "aaaeeeeiioouuuc"))
 
-    Permet d'ajuster les seuils sans toucher au code ni redeployer.
+
+def _nombre(valeur) -> float:
+    """Convertit une saisie en nombre, en tolérant les formats français."""
+    if isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
+        return float(valeur) if np.isfinite(valeur) else np.nan
+    if valeur is None:
+        return np.nan
+    t = (str(valeur).strip().replace("\u202f", "").replace("\xa0", "")
+         .replace(" ", "").replace("€", "").replace("$", ""))
+    if not t:
+        return np.nan
+    if "," in t and "." in t:
+        t = (t.replace(".", "").replace(",", ".")
+             if t.rindex(",") > t.rindex(".") else t.replace(",", ""))
+    elif "," in t:
+        t = t.replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return np.nan
+
+
+def url_csv(url: str) -> list[str]:
+    """Adresses de téléchargement possibles pour une feuille Google."""
+    url = url.strip()
+    if not url:
+        return []
+    if "output=csv" in url or "format=csv" in url:
+        return [url]
+    trouve = re.search(r"/spreadsheets/d/(?:e/)?([a-zA-Z0-9-_]+)", url)
+    if not trouve:
+        return [url]
+    cle = trouve.group(1)
+    gid = re.search(r"[#&?]gid=([0-9]+)", url)
+    suffixe = f"&gid={gid.group(1)}" if gid else ""
+    if cle.startswith("2PACX") or "/d/e/" in url:
+        return [f"https://docs.google.com/spreadsheets/d/e/{cle}"
+                f"/pub?output=csv{suffixe}"]
+    racine = f"https://docs.google.com/spreadsheets/d/{cle}"
+    return [f"{racine}/export?format=csv{suffixe}",
+            f"{racine}/gviz/tq?tqx=out:csv"]
+
+
+def lire_univers(url: str) -> pd.DataFrame:
     """
-    brut = os.environ.get("REGLES_VEILLE", "")
-    regles = json.loads(json.dumps(REGLES_DEFAUT))
-    if brut:
+    Charge l'univers depuis la feuille et applique les règles de strate.
+
+    Deux corrections automatiques. Une valeur détenue est en A quoi qu'indique
+    la feuille — on ne peut pas être candidat à ce qu'on possède. Une valeur
+    déclarée B sans prix d'entrée redescend en C : c'est le filtre dur qui
+    empêche la strate B de devenir un fourre-tout.
+    """
+    brut = None
+    for adresse in url_csv(url):
         try:
-            for cle, valeurs in json.loads(brut).items():
-                if cle in regles:
-                    regles[cle].update(valeurs)
-        except json.JSONDecodeError:
-            print("REGLES_VEILLE illisible, valeurs par défaut retenues.",
-                  file=sys.stderr)
-    return regles
+            essai = pd.read_csv(adresse)
+            if not essai.empty:
+                brut = essai
+                break
+        except Exception:
+            continue
+    if brut is None:
+        raise ValueError("Feuille inaccessible. Vérifie qu'elle est publiée "
+                         "au format CSV.")
+
+    correspondance = {}
+    for colonne in brut.columns:
+        nom = _propre(colonne)
+        for cible, variantes in SYNONYMES.items():
+            if cible in correspondance.values():
+                continue
+            if nom in variantes or any(v in nom for v in variantes):
+                correspondance[colonne] = cible
+                break
+    brut = brut.rename(columns=correspondance)
+
+    if "ticker" not in brut.columns:
+        raise ValueError(f"Colonne Ticker introuvable. Colonnes trouvées : "
+                         f"{', '.join(map(str, brut.columns))}.")
+
+    lignes = []
+    for _, ligne in brut.iterrows():
+        ticker = str(ligne.get("ticker", "")).strip().upper()
+        if not ticker or ticker in ("NAN", "TICKER"):
+            continue
+        quantite = _nombre(ligne.get("quantite"))
+        entree = _nombre(ligne.get("prix_entree"))
+        strate = str(ligne.get("strate", "C")).strip().upper()[:1]
+        if strate not in ("A", "B", "C"):
+            strate = "C"
+        if quantite > 0:
+            strate = "A"
+        elif strate == "B" and not np.isfinite(entree):
+            strate = "C"
+
+        lignes.append({
+            "ticker": ticker, "strate": strate, "quantite": quantite,
+            "pru": _nombre(ligne.get("pru")), "prix_entree": entree,
+            "prix_sortie": _nombre(ligne.get("prix_sortie")),
+            "concurrents": str(ligne.get("concurrents", "") or "").strip()})
+    return pd.DataFrame(lignes).drop_duplicates(subset="ticker")
+
+
+def concurrents(univers: pd.DataFrame) -> dict[str, list[str]]:
+    """Pairs déclarés pour chaque ligne détenue."""
+    sortie = {}
+    for _, ligne in univers[univers["strate"] == "A"].iterrows():
+        liste = [t.strip().upper() for t in
+                 str(ligne.get("concurrents", "") or "").replace(";", ",").split(",")
+                 if t.strip()]
+        if liste:
+            sortie[ligne["ticker"]] = liste
+    return sortie
 
 
 # ==========================================================================
-# Mémoire des alertes déjà émises
+# 3. ALERTES
+# ==========================================================================
+
+def charger_cours(tickers: list[str], periode: str = "1y") -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
+    brut = yf.download(tickers, period=periode, interval="1d",
+                       auto_adjust=True, progress=False, group_by="column")
+    if brut.empty:
+        return pd.DataFrame()
+    cours = (brut["Close"] if isinstance(brut.columns, pd.MultiIndex)
+             else brut[["Close"]].rename(columns={"Close": tickers[0]}))
+    return cours.dropna(how="all").ffill()
+
+
+def seuil(prix: pd.Series) -> float:
+    """Seuil de mouvement propre au titre, en pourcentage."""
+    r = prix.pct_change().dropna().tail(120)
+    if len(r) < 40:
+        return PLANCHER * 2
+    ecart = float(r.std(ddof=1)) * 100
+    return PLANCHER if ecart <= 0 else float(
+        np.clip(ecart * SIGMA, PLANCHER, PLAFOND))
+
+
+def _publication(ticker: str) -> dict | None:
+    try:
+        dates = yf.Ticker(ticker).earnings_dates
+        if dates is None or dates.empty:
+            return None
+        index = pd.to_datetime(dates.index)
+        table = dates.copy()
+        table.index = index.tz_localize(None) if index.tz is not None else index
+        futures = table[table.index >= pd.Timestamp.now().normalize()]
+        if "Reported EPS" in table.columns:
+            futures = futures[futures["Reported EPS"].isna()]
+        if futures.empty:
+            return None
+        prochaine = futures.sort_index()
+        return {"ticker": ticker, "date": prochaine.index[0],
+                "jours": int((prochaine.index[0]
+                              - pd.Timestamp.now().normalize()).days),
+                "bpa": float(prochaine.iloc[0].get("EPS Estimate", np.nan))}
+    except Exception:
+        return None
+
+
+def calendrier(tickers: list[str]) -> list[dict]:
+    """Prochaines publications, en parallèle bridé pour ménager Yahoo."""
+    sortie = []
+    with ThreadPoolExecutor(max_workers=FILS) as pool:
+        taches = []
+        for ticker in tickers:
+            taches.append(pool.submit(_publication, ticker))
+            time.sleep(0.15)
+        for tache in as_completed(taches):
+            try:
+                if (resultat := tache.result()):
+                    sortie.append(resultat)
+            except Exception:
+                continue
+    return sorted(sortie, key=lambda p: p["jours"])
+
+
+def detecter(univers: pd.DataFrame, cours: pd.DataFrame,
+             publications: list[dict], mode: str) -> list[dict]:
+    """
+    Toutes les alertes du passage.
+
+    Chaque alerte porte sa priorité, sa strate, et un indicateur `sonore`
+    explicite : le franchissement d'un prix d'entrée en strate B doit sonner
+    malgré son rang P2, parce que c'est l'alerte que l'on attend vraiment.
+    """
+    alertes = []
+    if cours.empty:
+        return alertes
+    strates = dict(zip(univers["ticker"], univers["strate"]))
+
+    for _, ligne in univers.iterrows():
+        t = ligne["ticker"]
+        if t not in cours.columns:
+            continue
+        prix = cours[t].dropna()
+        if len(prix) < 6:
+            continue
+
+        actuel, veille = float(prix.iloc[-1]), float(prix.iloc[-2])
+        var = (actuel / veille - 1) * 100
+        cinq = (actuel / float(prix.iloc[-6]) - 1) * 100
+        s, entree, sortie = ligne["strate"], ligne["prix_entree"], ligne["prix_sortie"]
+        base = {"Cours": f"{actuel:.2f}", "Séance": f"{var:+.1f} %"}
+
+        if s == "B" and np.isfinite(entree):
+            if actuel <= entree < veille:
+                alertes.append({"ticker": t, "strate": "B", "priorite": "P2",
+                    "sonore": True, "nature": "prix_entree", "emoji": "⚡️",
+                    "titre": "Prix d'entrée franchi",
+                    "faits": {**base, "Prix visé": f"{entree:.2f}"}})
+            elif 0 < (actuel / entree - 1) * 100 <= PROXIMITE_ENTREE:
+                alertes.append({"ticker": t, "strate": "B", "priorite": "P2",
+                    "nature": "approche", "emoji": "📉",
+                    "titre": "Approche du prix d'entrée",
+                    "faits": {**base, "Prix visé": f"{entree:.2f}",
+                              "Écart": f"{(actuel / entree - 1) * 100:+.1f} %"}})
+
+        if s == "A":
+            if np.isfinite(sortie) and actuel <= sortie < veille:
+                alertes.append({"ticker": t, "strate": "A", "priorite": "P1",
+                    "nature": "seuil_vente", "emoji": "🔴",
+                    "titre": "Seuil de vente franchi",
+                    "faits": {**base, "Seuil": f"{sortie:.2f}"}})
+            elif abs(var) >= (limite := seuil(prix)):
+                alertes.append({"ticker": t, "strate": "A", "priorite": "P1",
+                    "nature": "mouvement", "emoji": "⚠️",
+                    "titre": f"Mouvement de séance {var:+.1f} %",
+                    "faits": {**base, "Seuil du titre": f"±{limite:.1f} %",
+                              "5 séances": f"{cinq:+.1f} %"}})
+
+        if s == "C":
+            if np.isfinite(entree):
+                ecart = (actuel / entree - 1) * 100
+                if actuel <= entree < veille:
+                    alertes.append({"ticker": t, "strate": "C", "priorite": "P2",
+                        "nature": "prix_cible", "emoji": "🎯",
+                        "titre": "Prix cible atteint",
+                        "faits": {**base, "Cible": f"{entree:.2f}"}})
+                elif 0 < ecart <= PROXIMITE_CIBLE:
+                    alertes.append({"ticker": t, "strate": "C", "priorite": "P3",
+                        "nature": "proximite", "emoji": "🎯",
+                        "titre": f"À {ecart:.0f} % du prix cible",
+                        "faits": {**base, "Cible": f"{entree:.2f}"}})
+            limite_5j = -min(seuil(prix) * 2.2, 35.0)
+            if cinq <= limite_5j:
+                alertes.append({"ticker": t, "strate": "C", "priorite": "P2",
+                    "nature": "decrochage", "emoji": "⚠️",
+                    "titre": f"Repli de {abs(cinq):.0f} % en 5 séances",
+                    "faits": {**base, "5 séances": f"{cinq:+.1f} %",
+                              "Seuil du titre": f"{limite_5j:.0f} %"}})
+
+    # Concentration : une seule alerte, sur la ligne la plus lourde
+    detenues = univers[(univers["strate"] == "A")
+                       & (univers["quantite"].fillna(0) > 0)]
+    valeurs = {r["ticker"]: float(cours[r["ticker"]].dropna().iloc[-1])
+                            * float(r["quantite"])
+               for _, r in detenues.iterrows()
+               if r["ticker"] in cours.columns
+               and not cours[r["ticker"]].dropna().empty}
+    total = sum(valeurs.values())
+    if total > 0:
+        poids = sorted(((t, v / total * 100) for t, v in valeurs.items()),
+                       key=lambda x: -x[1])
+        if poids[0][1] > CONCENTRATION:
+            alertes.append({"ticker": poids[0][0], "strate": "A",
+                "priorite": "P2", "nature": "concentration", "emoji": "⚠️",
+                "titre": f"Concentration : {poids[0][1]:.0f} % du portefeuille",
+                "faits": {"Poids": f"{poids[0][1]:.1f} %",
+                          "Seuil": f"{CONCENTRATION:.0f} %"}})
+
+    # Concurrents : un avertissement chez un pair précède souvent le vôtre
+    for detenue, pairs in concurrents(univers).items():
+        for pair in pairs:
+            if pair not in cours.columns:
+                continue
+            prix = cours[pair].dropna()
+            if len(prix) < 6:
+                continue
+            var = (float(prix.iloc[-1]) / float(prix.iloc[-2]) - 1) * 100
+            if abs(var) >= max(seuil(prix), CONCURRENT):
+                alertes.append({"ticker": pair, "strate": "A", "priorite": "P2",
+                    "nature": "concurrent", "emoji": "👥",
+                    "titre": f"{var:+.1f} % — concurrent de {detenue}",
+                    "faits": {"Cours": f"{float(prix.iloc[-1]):.2f}",
+                              "Séance": f"{var:+.1f} %",
+                              "Ligne détenue": detenue}})
+
+    # Rappel J-1, le matin uniquement
+    if mode == "matin":
+        for p in publications:
+            s = strates.get(p["ticker"], "C")
+            if s == "C" or p["jours"] != 1:
+                continue
+            faits = {"Date": p["date"].strftime("%d/%m/%Y")}
+            if p["bpa"] == p["bpa"]:
+                faits["BPA attendu"] = f"{p['bpa']:.2f}"
+            alertes.append({"ticker": p["ticker"], "strate": s,
+                "priorite": "P1" if s == "A" else "P2",
+                "nature": "publication", "emoji": "📅",
+                "titre": "Résultats demain", "faits": faits})
+
+    # Un franchissement de seuil rend l'alerte de mouvement redondante
+    par_ticker: dict[str, list[dict]] = {}
+    for a in alertes:
+        par_ticker.setdefault(a["ticker"], []).append(a)
+    retenues = []
+    for groupe in par_ticker.values():
+        natures = {a["nature"] for a in groupe}
+        if natures & {"seuil_vente", "prix_entree", "prix_cible"}:
+            groupe = [a for a in groupe if a["nature"] not in
+                      ("mouvement", "approche", "proximite")]
+        retenues.extend(groupe)
+    return retenues
+
+
+# ==========================================================================
+# 4. BUDGET
 # ==========================================================================
 
 def lire_etat() -> dict:
-    if FICHIER_ETAT.exists():
-        try:
-            return json.loads(FICHIER_ETAT.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def ecrire_etat(etat: dict) -> None:
-    FICHIER_ETAT.write_text(json.dumps(etat, indent=1, ensure_ascii=False))
-
-
-def deja_signalee(etat: dict, identifiant: str) -> bool:
-    """Vrai si cette alerte a deja ete emise recemment."""
-    horodatage = etat.get(identifiant)
-    if not horodatage:
-        return False
+    aujourdhui = datetime.now().strftime("%Y-%m-%d")
+    vide = {"date": aujourdhui, "sonores": 0, "messages": 0, "envoyees": {}}
+    if not ETAT.exists():
+        return vide
     try:
-        emise = datetime.fromisoformat(horodatage)
-    except ValueError:
-        return False
-    return datetime.now(timezone.utc) - emise < timedelta(days=DELAI_REPETITION)
+        etat = json.loads(ETAT.read_text())
+    except Exception:
+        return vide
+    if etat.get("date") != aujourdhui:
+        etat.update({"date": aujourdhui, "sonores": 0, "messages": 0})
+    limite = (datetime.now() - timedelta(days=MEMOIRE_JOURS)).isoformat()
+    etat["envoyees"] = {k: v for k, v in etat.get("envoyees", {}).items()
+                        if v > limite}
+    return etat
+
+
+def en_silence() -> bool:
+    maintenant = datetime.now().time()
+    return maintenant >= SILENCE_DEBUT or maintenant < SILENCE_FIN
+
+
+def arbitrer(alertes: list[dict], etat: dict) -> dict:
+    """
+    Applique le budget : anti-répétition, groupement, plafonds, silence.
+
+    Rien n'est perdu : ce qui ne part pas est reporté au digest avec son motif.
+    """
+    nouvelles = [a for a in alertes
+                 if f"{a['ticker']}|{a['nature']}" not in etat["envoyees"]]
+
+    familles: dict[tuple, list[dict]] = {}
+    for a in nouvelles:
+        familles.setdefault((a["ticker"], a["nature"]), []).append(a)
+    nouvelles = []
+    for (ticker, nature), groupe in familles.items():
+        if len(groupe) >= GROUPEMENT:
+            principale = dict(groupe[0])
+            principale["titre"] = f"{len(groupe)} alertes ({nature})"
+            nouvelles.append(principale)
+        else:
+            nouvelles.extend(groupe)
+
+    rang_p = {"P1": 0, "P2": 1, "P3": 2}
+    rang_s = {"A": 0, "B": 1, "C": 2}
+    nouvelles.sort(key=lambda a: (
+        0 if a.get("sonore") else rang_p.get(a["priorite"], 9),
+        rang_s.get(a["strate"], 9)))
+
+    sonores, silencieuses, reportees = [], [], []
+    compte_s, compte_m = etat.get("sonores", 0), etat.get("messages", 0)
+
+    for a in nouvelles:
+        if a["priorite"] == "P3":
+            reportees.append({**a, "motif": "P3 — digest"})
+        elif compte_m >= MAX_MESSAGES:
+            reportees.append({**a, "motif": "plafond quotidien"})
+        elif en_silence() and not (a["priorite"] == "P1" and a["strate"] == "A"):
+            reportees.append({**a, "motif": "plage de silence"})
+        else:
+            # bool() explicite : `a.get("sonore")` vaut None quand la clé
+            # est absente, ce qui propagerait None dans toute l'expression.
+            sonne = bool(a["strate"] != "C" and not en_silence()
+                         and (a["priorite"] == "P1" or a.get("sonore"))
+                         and compte_s < MAX_SONORES)
+            (sonores if sonne else silencieuses).append(a)
+            compte_s += int(sonne)
+            compte_m += 1
+
+    return {"sonores": sonores, "silencieuses": silencieuses,
+            "reportees": reportees, "compte_s": compte_s, "compte_m": compte_m}
+
+
+def enregistrer(arbitrage: dict, etat: dict) -> None:
+    etat["sonores"], etat["messages"] = arbitrage["compte_s"], arbitrage["compte_m"]
+    maintenant = datetime.now().isoformat()
+    for a in arbitrage["sonores"] + arbitrage["silencieuses"]:
+        etat["envoyees"][f"{a['ticker']}|{a['nature']}"] = maintenant
+    try:
+        ETAT.write_text(json.dumps(etat, indent=1, ensure_ascii=False))
+    except Exception:
+        pass
 
 
 # ==========================================================================
-# Évaluation des règles
+# 5. MESSAGES
 # ==========================================================================
 
-def _rsi(prix: pd.Series, n: int = 14) -> float:
-    delta = prix.diff()
-    gains = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    pertes = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    valeur = 100 - 100 / (1 + gains / pertes.replace(0, np.nan))
-    return float(valeur.iloc[-1]) if len(valeur.dropna()) else np.nan
+def echapper(texte) -> str:
+    """Un titre contenant « AT&T » ferait rejeter le message par Telegram."""
+    return html.escape(str(texte), quote=False)
 
 
-def evaluer(portefeuille: pd.DataFrame, cours: pd.DataFrame,
-            regles: dict, publications: dict | None = None) -> list[dict]:
-    """
-    Confronte l'etat du portefeuille aux regles actives.
+def formater(a: dict) -> str:
+    """Un message par alerte : titre, chiffres alignés, source."""
+    marque = " 💼" if a["strate"] == "A" else ""
+    entete = (f"{a.get('emoji', '•')} <b>{echapper(a['ticker'])}{marque} — "
+              f"{echapper(a['titre'])}</b>")
+    lignes = [f"{echapper(k)[:16].ljust(16, '.')} {echapper(v)}"
+              for k, v in a.get("faits", {}).items()]
+    tableau = "<pre>" + "\n".join(lignes) + "</pre>" if lignes else ""
+    pied = (f"<i>Yahoo Finance · {ETIQUETTES[a['strate']]} · "
+            f"{datetime.now().strftime('%d/%m %H:%M')}</i>")
+    return "\n\n".join(b for b in (entete, tableau, pied) if b)
 
-    Renvoie une liste d'alertes, chacune avec un identifiant stable qui sert
-    a l'anti-repetition.
-    """
-    alertes = []
-    if portefeuille.empty or cours.empty:
-        return alertes
 
-    valeurs, poids_cible = {}, {}
-    for _, ligne in portefeuille.iterrows():
-        t = ligne["Ticker"]
-        if t in cours.columns and not cours[t].dropna().empty:
-            valeurs[t] = float(cours[t].dropna().iloc[-1]) * float(ligne["Quantité"])
-            poids_cible[t] = float(ligne.get("Poids cible (%)", np.nan))
-    total = sum(valeurs.values())
-    if total <= 0:
-        return alertes
+def digest(univers: pd.DataFrame, cours: pd.DataFrame,
+           publications: list[dict], reportees: list[dict]) -> str:
+    """Synthèse du vendredi : le seul message qui prend du recul."""
+    if cours.empty:
+        return ""
+    blocs = [f"🗂 <b>SEMAINE — {datetime.now().strftime('%d/%m/%Y')}</b>"]
 
-    # --- Portefeuille dans son ensemble
-    lignes_valides = [t for t in valeurs if t in cours.columns]
-    if lignes_valides:
-        poids = pd.Series({t: valeurs[t] / total for t in lignes_valides})
-        rendements = cours[lignes_valides].pct_change().dropna()
-        if not rendements.empty:
-            r_ptf = (rendements * poids).sum(axis=1)
-            cumul = (1 + r_ptf).cumprod()
-            drawdown = float((cumul.iloc[-1] / cumul.cummax().iloc[-1] - 1) * 100)
-
-            regle = regles["drawdown_portefeuille"]
-            if regle["actif"] and drawdown <= regle["seuil_pct"]:
-                alertes.append({
-                    "id": f"drawdown|{int(drawdown // 5) * 5}",
-                    "titre": regle["libelle"],
-                    "corps": f"Le portefeuille est {drawdown:.1f} % sous son "
-                             f"plus haut. Seuil fixé à {regle['seuil_pct']} %.",
-                    "priorite": "haute",
-                })
-
-            regle = regles["volatilite_anormale"]
-            if regle["actif"] and len(r_ptf) > 260:
-                courte = float(r_ptf.tail(21).std(ddof=1) * np.sqrt(252) * 100)
-                longue = float(r_ptf.tail(252).std(ddof=1) * np.sqrt(252) * 100)
-                if longue > 0 and courte > longue * regle["multiple"]:
-                    alertes.append({
-                        "id": f"volatilite|{datetime.now().strftime('%Y-%W')}",
-                        "titre": regle["libelle"],
-                        "corps": f"Volatilité sur un mois à {courte:.0f} %, "
-                                 f"contre {longue:.0f} % sur un an.",
-                        "priorite": "haute",
-                    })
-
-    # --- Ligne par ligne
-    for t, valeur in valeurs.items():
-        part = valeur / total * 100
-        serie = cours[t].dropna()
-
-        regle = regles["concentration"]
-        if regle["actif"] and part > regle["seuil_pct"]:
-            alertes.append({
-                "id": f"concentration|{t}|{int(part // 5) * 5}",
-                "titre": f"{t} — {regle['libelle']}",
-                "corps": f"{t} représente {part:.1f} % du portefeuille "
-                         f"(seuil {regle['seuil_pct']} %).",
-                "priorite": "normale",
-            })
-
-        regle = regles["derive_poids"]
-        cible = poids_cible.get(t, np.nan)
-        if regle["actif"] and np.isfinite(cible) and cible > 0:
-            ecart = part - cible
-            if abs(ecart) >= regle["seuil_points"]:
-                alertes.append({
-                    "id": f"derive|{t}|{int(ecart // 5) * 5}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": f"Poids actuel {part:.1f} % contre {cible:.1f} % "
-                             f"visé, soit {ecart:+.1f} points.",
-                    "priorite": "normale",
-                })
-
-        regle = regles["donnees_perimees"]
-        if regle["actif"] and len(serie):
-            retard = int(np.busday_count(serie.index[-1].date(),
-                                         datetime.now().date()))
-            if retard > regle["jours_ouvres"]:
-                alertes.append({
-                    "id": f"perime|{t}|{serie.index[-1].date()}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": f"Dernier cours daté du {serie.index[-1].date()}, "
-                             f"soit {retard} jours ouvrés de retard.",
-                    "priorite": "normale",
-                })
-
-        if len(serie) < 220:
+    mouvements = []
+    for _, ligne in univers.iterrows():
+        t = ligne["ticker"]
+        if t not in cours.columns:
             continue
+        prix = cours[t].dropna()
+        if len(prix) >= 6:
+            var = (float(prix.iloc[-1]) / float(prix.iloc[-6]) - 1) * 100
+            if abs(var) >= 5:
+                mouvements.append((abs(var), t, ligne["strate"], var))
+    mouvements.sort(reverse=True)
 
-        regle = regles["rsi_bas"]
-        if regle["actif"]:
-            valeur_rsi = _rsi(serie)
-            if np.isfinite(valeur_rsi) and valeur_rsi < regle["seuil"]:
-                alertes.append({
-                    "id": f"rsi_bas|{t}|{datetime.now().strftime('%Y-%W')}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": f"RSI à {valeur_rsi:.0f}.",
-                    "priorite": "basse",
-                })
+    if mouvements:
+        blocs.append("<b>Mouvements > 5 %</b>\n<pre>" + "\n".join(
+            f"{t[:8].ljust(9)}{s}  {v:+6.1f} %"
+            for _, t, s, v in mouvements[:10]) + "</pre>")
+    else:
+        blocs.append("<i>Aucun mouvement supérieur à 5 % cette semaine.</i>")
 
-        regle = regles["rsi_haut"]
-        if regle["actif"]:
-            valeur_rsi = _rsi(serie)
-            if np.isfinite(valeur_rsi) and valeur_rsi > regle["seuil"]:
-                alertes.append({
-                    "id": f"rsi_haut|{t}|{datetime.now().strftime('%Y-%W')}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": f"RSI à {valeur_rsi:.0f}.",
-                    "priorite": "basse",
-                })
+    prochaines = [p for p in publications if p["jours"] <= 10]
+    if prochaines:
+        blocs.append("<b>Publications à venir</b>\n<pre>" + "\n".join(
+            f"{p['ticker'][:8].ljust(9)}{p['date'].strftime('%d/%m')}  "
+            f"J-{p['jours']}" for p in prochaines[:8]) + "</pre>")
 
-        regle = regles["franchissement_mm200"]
-        if regle["actif"]:
-            mm = serie.rolling(200).mean()
-            if len(mm.dropna()) > 2:
-                avant = serie.iloc[-2] > mm.iloc[-2]
-                apres = serie.iloc[-1] > mm.iloc[-1]
-                if avant != apres:
-                    sens = "au-dessus de" if apres else "sous"
-                    alertes.append({
-                        "id": f"mm200|{t}|{serie.index[-1].date()}",
-                        "titre": f"{t} — {regle['libelle']}",
-                        "corps": f"Le cours est repassé {sens} sa moyenne "
-                                 f"200 séances.",
-                        "priorite": "basse",
-                    })
+    if reportees:
+        compte: dict[str, int] = {}
+        for e in reportees:
+            compte[e["nature"]] = compte.get(e["nature"], 0) + 1
+        blocs.append("<b>Écarté des notifications</b>\n<pre>" + "\n".join(
+            f"{echapper(k)[:16].ljust(16, '.')} {v}"
+            for k, v in compte.items()) + "</pre>")
 
-        regle = regles["ecart_plus_haut"]
-        if regle["actif"]:
-            ecart = float(serie.iloc[-1] / serie.tail(252).max() - 1) * 100
-            if ecart <= regle["seuil_pct"]:
-                alertes.append({
-                    "id": f"ecart_haut|{t}|{int(ecart // 5) * 5}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": f"{ecart:.0f} % sous son plus haut sur un an.",
-                    "priorite": "basse",
-                })
-
-    # --- Publications à venir
-    regle = regles["publication_proche"]
-    if regle["actif"] and publications:
-        for t, date in publications.items():
-            if date is None:
-                continue
-            jours = (date - datetime.now().date()).days
-            if 0 <= jours <= regle["jours"]:
-                alertes.append({
-                    "id": f"publication|{t}|{date}",
-                    "titre": f"{t} — {regle['libelle']}",
-                    "corps": (f"Publication attendue le "
-                              f"{date.strftime('%d/%m')}"
-                              + (" — demain." if jours == 1 else
-                                 " — aujourd'hui." if jours == 0 else
-                                 f", dans {jours} jours.")),
-                    "priorite": "haute",
-                })
-
-    ordre = {"haute": 0, "normale": 1, "basse": 2}
-    return sorted(alertes, key=lambda a: ordre.get(a["priorite"], 3))
+    c = univers["strate"].value_counts().to_dict()
+    blocs.append(f"<i>Univers : {c.get('A', 0)} A · {c.get('B', 0)} B · "
+                 f"{c.get('C', 0)} C</i>")
+    return "\n\n".join(blocs)
 
 
-# ==========================================================================
-# Envoi des notifications
-# ==========================================================================
-
-def envoyer_ntfy(titre: str, corps: str, sujet: str,
-                 priorite: str = "normale") -> bool:
-    """
-    Notification via ntfy.sh — gratuit, sans compte ni inscription.
-
-    Le « sujet » est un identifiant que tu choisis et que tu abonnes dans
-    l'application ntfy sur ton telephone. Toute personne qui le connait peut
-    y publier : prends quelque chose de long et d'imprevisible.
-    """
-    niveaux = {"haute": "high", "normale": "default", "basse": "low"}
-    try:
-        reponse = requests.post(
-            f"https://ntfy.sh/{sujet}",
-            data=corps.encode("utf-8"),
-            headers={
-                "Title": titre.encode("utf-8"),
-                "Priority": niveaux.get(priorite, "default"),
-                "Tags": "chart_with_upwards_trend",
-            },
-            timeout=15,
-        )
-        return reponse.ok
-    except Exception as erreur:
-        print(f"Échec ntfy : {erreur}", file=sys.stderr)
-        return False
-
-
-def envoyer_telegram(message: str, jeton: str, destinataire: str) -> bool:
-    """
-    Notification via un bot Telegram.
-
-    Envoi en texte brut : le Markdown de Telegram echoue des qu'un asterisque
-    ou un tiret bas n'est pas apparie, ce qui arrive constamment dans un
-    commentaire redige librement. La mise en forme ne vaut pas le risque de
-    perdre le message.
-    """
+def envoyer(message: str, silencieux: bool = False) -> bool:
+    jeton = os.environ.get("TELEGRAM_JETON", "").strip()
+    destinataire = os.environ.get("TELEGRAM_DESTINATAIRE", "").strip()
     if not jeton or not destinataire:
-        print("Telegram : jeton ou destinataire manquant.", file=sys.stderr)
+        print("Telegram non configuré :\n" + message, file=sys.stderr)
         return False
+    if len(message) > 4096:
+        message = message[:4000] + "…"
     try:
         reponse = requests.post(
             f"https://api.telegram.org/bot{jeton}/sendMessage",
-            json={"chat_id": str(destinataire).strip(), "text": message,
-                  "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=20,
-        )
+            json={"chat_id": destinataire, "text": message,
+                  "parse_mode": "HTML", "disable_web_page_preview": True,
+                  "disable_notification": silencieux}, timeout=20)
         if not reponse.ok:
-            print(f"Telegram a refusé la requête (code {reponse.status_code}) : "
-                  f"{reponse.text[:300]}", file=sys.stderr)
-            return False
-        return True
+            print(f"Telegram a refusé ({reponse.status_code}) : "
+                  f"{reponse.text[:200]}", file=sys.stderr)
+        return reponse.ok
     except Exception as erreur:
-        print(f"Échec Telegram : {type(erreur).__name__} — {erreur}",
-              file=sys.stderr)
+        print(f"Échec Telegram : {erreur}", file=sys.stderr)
         return False
 
 
-def notifier(alertes: list[dict]) -> int:
-    """Envoie les alertes par les canaux configures. Renvoie le nombre d'envois."""
-    sujet_ntfy = os.environ.get("NTFY_SUJET", "").strip()
-    jeton_tg = os.environ.get("TELEGRAM_JETON", "").strip()
-    dest_tg = os.environ.get("TELEGRAM_DESTINATAIRE", "").strip()
-    envois = 0
-
-    print(f"Canaux — Telegram : {'configuré' if jeton_tg and dest_tg else 'absent'}"
-          f" | ntfy : {'configuré' if sujet_ntfy else 'absent'}")
-
-    if jeton_tg and dest_tg:
-        # Un message par alerte : chacune arrive séparément, à lire d'un coup
-        # d'œil. Les blocs groupés sont survolés puis oubliés.
-        for a in alertes:
-            corps = a.get("html") or mf.message_signal(
-                a["titre"], a["corps"], a.get("ticker", ""),
-                surveille=a.get("surveille", False),
-                chiffres=a.get("chiffres"))
-            valide, motif = mf.valider(corps)
-            if not valide:
-                print(f"Message écarté : {motif}", file=sys.stderr)
-                continue
-            if envoyer_telegram(corps, jeton_tg, dest_tg):
-                envois += 1
-                time.sleep(1)          # Telegram limite à ~30 messages/seconde
-
-    if sujet_ntfy:
-        for alerte in alertes:
-            if envoyer_ntfy(alerte["titre"], alerte["corps"],
-                            sujet_ntfy, alerte["priorite"]):
-                envois += 1
-
-    if not sujet_ntfy and not (jeton_tg and dest_tg):
-        print("Aucun canal configuré. Alertes non envoyées :", file=sys.stderr)
-        for a in alertes:
-            print(f"  [{a['priorite']}] {a['titre']} — {a['corps']}")
-
-    return envois
-
-
 # ==========================================================================
-# Exécution
+# 6. EXÉCUTION
 # ==========================================================================
-
-def charger_surveillance() -> list[str]:
-    """
-    Liste de valeurs suivies sans etre detenues.
-
-    Deux sources possibles : une liste de tickers dans TICKERS_SURVEILLANCE
-    (« NVDA, ASML.AS, MC.PA »), ou un second onglet Google publie dont
-    l'adresse est dans URL_SURVEILLANCE. La premiere colonne suffit.
-    """
-    brut = os.environ.get("TICKERS_SURVEILLANCE", "").strip()
-    if brut:
-        return [t.strip().upper() for t in brut.replace(";", ",").split(",")
-                if t.strip()]
-
-    url = os.environ.get("URL_SURVEILLANCE", "").strip()
-    if not url:
-        return []
-    try:
-        sys.path.insert(0, str(Path(__file__).parent))
-        import feuille as fe
-        df = pd.read_csv(fe.urls_candidates(url)[0])
-        colonne = df.columns[0]
-        return [str(t).strip().upper() for t in df[colonne].dropna()
-                if str(t).strip()]
-    except Exception as erreur:
-        print(f"Liste de surveillance illisible : {erreur}", file=sys.stderr)
-        return []
-
-
-def charger_portefeuille() -> pd.DataFrame:
-    """Portefeuille depuis la feuille Google publiee."""
-    url = os.environ.get("URL_FEUILLE", "")
-    if not url:
-        raise SystemExit("Variable URL_FEUILLE absente.")
-    sys.path.insert(0, str(Path(__file__).parent))
-    import feuille as fe
-    return fe.lire(url)
-
-
-# Signaux jugés urgents : eux seuls passent en mode surveillance
-URGENTS = {"publication_proche", "drawdown_portefeuille", "volatilite_anormale",
-           "retournement_momentum", "regime"}
-
-
-def filtrer_par_mode(alertes: list[dict], mode: str) -> list[dict]:
-    """
-    Sélectionne les alertes selon le moment de la journée.
-
-    En mode `urgence`, seul passe ce qui ne peut pas attendre le rendez-vous
-    du soir : un décrochage, une publication imminente, un changement de
-    régime. Tout le reste — momentum, révisions, valorisation — se lit très
-    bien douze heures plus tard, et l'envoyer immédiatement ne ferait
-    qu'éroder l'attention portée aux vraies urgences.
-    """
-    if mode != "urgence":
-        return alertes
-    return [a for a in alertes
-            if a.get("priorite") == "haute"
-            or any(cle in a.get("id", "") for cle in URGENTS)]
-
 
 def principal() -> int:
-    mode = os.environ.get("MODE_VEILLE", "soir")
-    print(f"Mode : {mode}")
-    regles = charger_config()
-    portefeuille = charger_portefeuille()
-    detenues = list(dict.fromkeys(portefeuille["Ticker"]))
-    surveillance = [t for t in charger_surveillance() if t not in detenues]
-    tickers = detenues + surveillance
-
-    print(f"{len(detenues)} valeur(s) détenue(s) : {', '.join(detenues)}")
-    if surveillance:
-        print(f"{len(surveillance)} valeur(s) surveillée(s) : "
-              f"{', '.join(surveillance)}")
-
-    donnees = yf.download(tickers, period="2y", interval="1d",
-                          auto_adjust=True, progress=False, group_by="column")
-    cours = (donnees["Close"] if isinstance(donnees.columns, pd.MultiIndex)
-             else donnees[["Close"]].rename(columns={"Close": tickers[0]}))
-    cours = cours.dropna(how="all").ffill()
-
-    publications = {}
-    if regles["publication_proche"]["actif"]:
-        for t in tickers:
-            try:
-                dates = yf.Ticker(t).earnings_dates
-                futures = dates[dates["Reported EPS"].isna()]
-                if not futures.empty:
-                    prochaine = pd.Timestamp(futures.sort_index().index[0])
-                    publications[t] = prochaine.tz_localize(None).date() \
-                        if prochaine.tzinfo else prochaine.date()
-            except Exception:
-                continue
-
-    alertes = evaluer(portefeuille, cours, regles, publications)
-    print(f"{len(alertes)} alerte(s) de gestion.")
-
-    # --- Signaux documentés, avec contexte propre à chaque société
-    contextes, alertes_signaux = {}, []
-    try:
-        valeurs = {}
-        for _, ligne in portefeuille.iterrows():
-            t = ligne["Ticker"]
-            if t in cours.columns and not cours[t].dropna().empty:
-                valeurs[t] = float(cours[t].dropna().iloc[-1]) * float(ligne["Quantité"])
-        total_ptf = sum(valeurs.values())
-
-        # Contribution au risque de chaque ligne
-        parts_risque = {}
-        if total_ptf > 0 and len(valeurs) > 1:
-            w = pd.Series({t: v / total_ptf for t, v in valeurs.items()})
-            covariance = cours[list(w.index)].pct_change().dropna().cov() * 252
-            vol = float(np.sqrt(w @ covariance.to_numpy() @ w))
-            if vol > 0:
-                contributions = w.to_numpy() * (covariance.to_numpy() @ w.to_numpy()) / vol
-                parts_risque = {t: float(c / vol * 100)
-                                for t, c in zip(w.index, contributions)}
-
-        a_analyser = {t: valeurs.get(t) for t in tickers
-                      if t in cours.columns and not cours[t].dropna().empty}
-
-        for t, valeur in a_analyser.items():
-            info, surprises, revisions = {}, None, None
-            try:
-                ticker_yf = yf.Ticker(t)
-                info = dict(ticker_yf.info)
-                dates = ticker_yf.earnings_dates
-                if dates is not None and not dates.empty and "Surprise(%)" in dates.columns:
-                    surprises = dates.rename(
-                        columns={"Surprise(%)": "Surprise (%)"})[["Surprise (%)"]].dropna()
-                tendance = ticker_yf.eps_trend
-                if tendance is not None and not tendance.empty \
-                        and {"current", "90daysAgo"} <= set(tendance.columns):
-                    actuelle = float(tendance["current"].iloc[0])
-                    ancienne = float(tendance["90daysAgo"].iloc[0])
-                    if ancienne:
-                        revisions = pd.DataFrame({
-                            "Révision sur 90 jours (%)":
-                                [(actuelle - ancienne) / abs(ancienne) * 100]})
-            except Exception:
-                pass
-
-            contextes[t] = sg.contexte_societe(
-                t, cours[t],
-                poids_pct=(valeur / total_ptf * 100
-                           if valeur is not None and total_ptf > 0 else None),
-                part_risque_pct=parts_risque.get(t),
-                info=info, surprises=surprises, revisions=revisions)
-
-        indice = None
-        if regles["regime"]["actif"]:
-            try:
-                brut = yf.download(regles["regime"]["indice"], period="2y",
-                                   progress=False, auto_adjust=True)
-                if isinstance(brut.columns, pd.MultiIndex):
-                    brut.columns = brut.columns.get_level_values(0)
-                indice = brut["Close"].dropna()
-            except Exception:
-                pass
-
-        actifs = {c: regles.get(c, {}).get("actif", False)
-                  for c in ("momentum", "derive_resultats", "revisions",
-                            "plus_haut", "dimensionnement", "regime")}
-        alertes_signaux = sg.evaluer_tout(cours, contextes, indice, actifs)
-        print(f"{len(alertes_signaux)} signal(aux) déclenché(s).")
-
-        # Rédaction par Claude, avec repli sur les gabarits en cas d'échec
-        if mode != "urgence":
-            alertes_signaux = rd.enrichir(alertes_signaux, contextes,
-                                          os.environ.get("CLE_ANTHROPIC", ""))
-        rediges = sum(1 for a in alertes_signaux if a.get("rédigé_par_ia"))
-        print(f"{rediges} commentaire(s) rédigé(s) par IA.")
-
-        for a in alertes_signaux:
-            contexte_a = contextes.get(a["ticker"], {})
-            chiffres = {}
-            for libelle, cle_ctx, unite in [
-                ("Poids", "poids_pct", " %"),
-                ("Part du risque", "part_risque_pct", " %"),
-                ("Volatilité", "volatilite_pct", " %"),
-                ("Écart au plus haut", "ecart_plus_haut_pct", " %"),
-            ]:
-                valeur_c = contexte_a.get(cle_ctx)
-                if valeur_c is not None:
-                    chiffres[libelle] = f"{valeur_c:.0f}{unite}"
-
-            # Le titre porte déjà le nom : on ne garde que la nature du signal
-            titre_court = a["titre"].split(" — ")[-1]
-            alertes.append({
-                "id": f"signal|{a['type']}|{a['ticker']}|"
-                      f"{datetime.now().strftime('%Y-%W')}",
-                "titre": titre_court,
-                "ticker": a["ticker"],
-                "surveille": a["ticker"] in surveillance,
-                "chiffres": chiffres,
-                "corps": a["commentaire"],
-                "priorite": "normale",
-            })
-    except Exception as erreur:
-        print(f"Signaux indisponibles : {type(erreur).__name__} — {erreur}",
-              file=sys.stderr)
-
-    print(f"{len(alertes)} alerte(s) au total.")
-
-    alertes = filtrer_par_mode(alertes, mode)
-    if mode == "urgence":
-        print(f"{len(alertes)} alerte(s) retenue(s) comme urgentes.")
-
-    etat = lire_etat()
-    nouvelles = [a for a in alertes if not deja_signalee(etat, a["id"])]
-    print(f"{len(nouvelles)} nouvelle(s) après filtrage anti-répétition.")
-
-    if not nouvelles:
-        return 0
-
-    # Quota par passage : étale les alertes sur la journée plutôt que de tout
-    # déverser d'un coup. Le reste attend le passage suivant.
-    quota = int(os.environ.get("QUOTA_PAR_PASSAGE",
-                               "5" if mode == "urgence" else "3"))
-    ordre = {"haute": 0, "normale": 1, "basse": 2}
-    nouvelles.sort(key=lambda a: ordre.get(a.get("priorite"), 3))
-    if len(nouvelles) > quota:
-        print(f"Quota de {quota} par passage : {len(nouvelles) - quota} "
-              f"alerte(s) reportée(s) au prochain passage.")
-        nouvelles = nouvelles[:quota]
-
-    envois = notifier(nouvelles)
-    print(f"{envois} notification(s) envoyée(s).")
-
-    if envois == 0:
-        print("Aucun envoi réussi : les alertes ne sont pas mémorisées, "
-              "elles seront réessayées au prochain passage.", file=sys.stderr)
+    mode = os.environ.get("MODE", "seance")
+    url = os.environ.get("URL_UNIVERS", "").strip()
+    if not url:
+        print("Variable URL_UNIVERS absente.", file=sys.stderr)
         return 1
 
-    maintenant = datetime.now(timezone.utc).isoformat()
-    for alerte in nouvelles:
-        etat[alerte["id"]] = maintenant
+    print(f"Mode : {mode}")
+    try:
+        univers = lire_univers(url)
+    except ValueError as erreur:
+        print(f"Univers illisible : {erreur}", file=sys.stderr)
+        return 1
 
-    limite = datetime.now(timezone.utc) - timedelta(days=60)
-    etat = {k: v for k, v in etat.items()
-            if datetime.fromisoformat(v) > limite}
-    ecrire_etat(etat)
+    c = univers["strate"].value_counts().to_dict()
+    print(f"Univers : {c.get('A', 0)} A, {c.get('B', 0)} B, {c.get('C', 0)} C.")
+
+    pairs = concurrents(univers)
+    tickers = list(dict.fromkeys(univers["ticker"].tolist()
+                   + [p for liste in pairs.values() for p in liste]))
+    cours = charger_cours(tickers)
+    if cours.empty:
+        print("Aucun cours disponible.", file=sys.stderr)
+        return 1
+
+    publications = []
+    if mode in ("matin", "digest"):
+        publications = calendrier(
+            univers[univers["strate"].isin(["A", "B"])]["ticker"].tolist())
+        print(f"{len(publications)} publication(s) au calendrier.")
+
+    alertes = detecter(univers, cours, publications, mode)
+    print(f"{len(alertes)} alerte(s) détectée(s).")
+
+    etat = lire_etat()
+    arbitrage = arbitrer(alertes, etat)
+    print(f"Arbitrage : {len(arbitrage['sonores'])} sonore(s), "
+          f"{len(arbitrage['silencieuses'])} silencieuse(s), "
+          f"{len(arbitrage['reportees'])} reportée(s).")
+
+    envois = 0
+    for a in arbitrage["sonores"]:
+        if envoyer(formater(a)):
+            envois += 1
+            time.sleep(1)
+    for a in arbitrage["silencieuses"]:
+        if envoyer(formater(a), silencieux=True):
+            envois += 1
+            time.sleep(1)
+
+    if mode == "digest":
+        message = digest(univers, cours, publications, arbitrage["reportees"])
+        if message and envoyer(message, silencieux=True):
+            envois += 1
+
+    if envois:
+        enregistrer(arbitrage, etat)
+    print(f"{envois} message(s) envoyé(s).")
     return 0
 
 
