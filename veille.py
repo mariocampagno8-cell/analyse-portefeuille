@@ -153,13 +153,20 @@ def lire_univers(url: str) -> pd.DataFrame:
             if nom in variantes or any(v in nom for v in variantes):
                 correspondance[colonne] = cible
                 break
+    reconnues = {v: k for k, v in correspondance.items()}
+    print("Colonnes reconnues : " + ", ".join(
+        f"{cible} ← « {origine} »" for cible, origine in reconnues.items()))
+    ignorees = [c for c in brut.columns if c not in correspondance]
+    if ignorees:
+        print("Colonnes ignorées : " + ", ".join(map(str, ignorees)))
+
     brut = brut.rename(columns=correspondance)
 
     if "ticker" not in brut.columns:
         raise ValueError(f"Colonne Ticker introuvable. Colonnes trouvées : "
                          f"{', '.join(map(str, brut.columns))}.")
 
-    lignes = []
+    lignes, reclassements = [], []
     for _, ligne in brut.iterrows():
         ticker = str(ligne.get("ticker", "")).strip().upper()
         if not ticker or ticker in ("NAN", "TICKER"):
@@ -170,8 +177,11 @@ def lire_univers(url: str) -> pd.DataFrame:
         if strate not in ("A", "B", "C"):
             strate = "C"
         if quantite > 0:
+            if strate != "A":
+                reclassements.append(f"{ticker} : {strate} → A (position détenue)")
             strate = "A"
         elif strate == "B" and not np.isfinite(entree):
+            reclassements.append(f"{ticker} : B → C (prix d'entrée absent)")
             strate = "C"
 
         lignes.append({
@@ -179,6 +189,13 @@ def lire_univers(url: str) -> pd.DataFrame:
             "pru": _nombre(ligne.get("pru")), "prix_entree": entree,
             "prix_sortie": _nombre(ligne.get("prix_sortie")),
             "concurrents": str(ligne.get("concurrents", "") or "").strip()})
+    if reclassements:
+        print(f"{len(reclassements)} reclassement(s) automatique(s) :")
+        for motif in reclassements[:15]:
+            print(f"  {motif}")
+        if len(reclassements) > 15:
+            print(f"  … et {len(reclassements) - 15} autre(s)")
+
     return pd.DataFrame(lignes).drop_duplicates(subset="ticker")
 
 
@@ -597,6 +614,17 @@ def principal() -> int:
 
     c = univers["strate"].value_counts().to_dict()
     print(f"Univers : {c.get('A', 0)} A, {c.get('B', 0)} B, {c.get('C', 0)} C.")
+
+    avec_cible = int(univers["prix_entree"].notna().sum())
+    avec_seuil = int(univers["prix_sortie"].notna().sum())
+    print(f"Seuils renseignés : {avec_cible} prix d'entrée, "
+          f"{avec_seuil} seuil(s) de vente.")
+    if avec_cible == 0 and avec_seuil == 0:
+        print("ATTENTION : aucun seuil de prix renseigné. Le système ne peut "
+              "déclencher aucune alerte de franchissement — c'est-à-dire "
+              "l'essentiel de son intérêt. Remplis la colonne « Prix entrée » "
+              "pour tes candidats et « Prix sortie » pour tes lignes détenues.",
+              file=sys.stderr)
 
     pairs = concurrents(univers)
     tickers = list(dict.fromkeys(univers["ticker"].tolist()
