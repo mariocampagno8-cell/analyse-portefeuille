@@ -1,22 +1,25 @@
 """
-Charte graphique FinexResearch v1.0.
+Conventions d'affichage FinexResearch.
 
-Deux apports distincts, et le second compte davantage que le premier.
+Parti pris, apres un essai rate : ne pas redecorer Streamlit. Son rendu natif
+est coherent ; le recouvrir d'une charte concue pour une application web sur
+mesure produit un resultat batard, ni l'un ni l'autre.
 
-L'APPARENCE — jetons de couleur, polices, chiffres tabulaires — s'applique par
-injection CSS. Streamlit impose son propre rendu pour certains composants :
-la hauteur de ligne exacte des tableaux et le filet appuyé sous les en-têtes
-ne sont pas atteignables. Ce qui l'est l'est integralement.
+Ce module se limite donc a ce qui sert reellement la lecture :
 
-L'ECRITURE DES CHIFFRES est la partie qui empeche reellement une erreur de
-lecture, et elle s'applique sans reserve : separateur de milliers en espace
-insecable fine, virgule decimale, signe toujours explicite, moins
-typographique, cadratin pour une donnee absente plutot qu'un zero trompeur.
+  L'ECRITURE DES CHIFFRES, qui est la partie qui empeche une erreur de
+  lecture. Separateur de milliers en espace insecable fine, virgule decimale,
+  signe toujours explicite, moins typographique aligne sur le plus, cadratin
+  pour une donnee absente plutot qu'un zero trompeur.
 
-Regle structurante : le vert et le rouge ne signifient que gain et perte. Ils
-n'apparaissent jamais dans un bouton, un en-tete ou une etiquette. C'est
-pourquoi la couleur de marque est un laiton neutre, impossible a confondre
-avec un signe.
+  TROIS RETOUCHES visuelles seulement : chiffres tabulaires pour que les
+  colonnes s'alignent, laiton a la place du rouge Streamlit sur les elements
+  actifs, et classes de couleur pour les valeurs de performance.
+
+Regle conservee du document d'origine, la plus utile de toutes : le vert et le
+rouge ne signifient que gain et perte. C'est pourquoi l'accent de l'interface
+est un laiton neutre — un onglet actif en rouge, dans une application
+financiere, est une faute de lecture.
 """
 
 from __future__ import annotations
@@ -239,136 +242,74 @@ def pastille(etat: str) -> str:
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=Archivo:wght@400;500;600&family=IBM+Plex+Mono:wght@400&display=swap');
+/* ------------------------------------------------------------------
+   Retouches minimales.
 
-:root{
-  --paper:#F0F0EB; --surface:#FFFFFF; --sunk:#E7E8E2;
-  --ink:#191C1A;   --ink-2:#4A504C;   --ink-3:#797F7A;
-  --rule:#D4D6CF;  --rule-strong:#B3B7AE;
-  --brass:#8A6A21; --brass-ink:#6B5119; --brass-soft:#EFE7D1; --info:#2C5A72;
-  --gain:#1F6B4D;  --loss:#A93226;    --flat:#797F7A;
-  --s1:#123B4D; --s2:#8A6A21; --s3:#4E7A66;
-  --s4:#7A4B63; --s5:#35566E; --s6:#A0602E;
-  --serif:"Source Serif 4",Georgia,serif;
-  --sans:"Archivo","Helvetica Neue",Arial,sans-serif;
-  --mono:"IBM Plex Mono",ui-monospace,Consolas,monospace;
-  --r-sm:2px; --r-md:3px; --r-lg:5px;
-  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:18px; --sp-5:32px; --sp-6:56px;
-  --row-h:36px;
+   Le rendu natif de Streamlit est propre et cohérent : le remplacer par
+   une surcouche produit un résultat bâtard, ni l'un ni l'autre. On ne
+   touche donc qu'à ce qui sert la lecture des chiffres, et on laisse la
+   mise en page tranquille.
+
+   Trois interventions, pas une de plus :
+     1. chiffres tabulaires, pour que les colonnes s'alignent
+     2. laiton à la place du rouge Streamlit sur les éléments actifs —
+        le rouge doit rester disponible pour signifier une perte
+     3. classes de couleur sémantique pour les valeurs affichées en HTML
+   ------------------------------------------------------------------ */
+
+/* 1. Le chiffre commande la mise en page ---------------------------- */
+[data-testid="stDataFrame"] td,
+[data-testid="stDataFrame"] th,
+[data-testid="stMetricValue"],
+[data-testid="stMetricDelta"],
+.num{
+  font-variant-numeric:tabular-nums lining-nums;
+}
+.stNumberInput input{
+  text-align:right;
+  font-variant-numeric:tabular-nums;
 }
 
-/* --- Décor général ------------------------------------------------- */
-.stApp{background:var(--paper);color:var(--ink);}
-section.main .block-container{max-width:1160px;padding-top:2rem;}
-html,body,[class*="css"],.stMarkdown,p,li,label,div[data-baseweb]{
-  font-family:var(--sans);font-size:15px;line-height:1.55;color:var(--ink);}
-
-/* --- Titres : voix éditoriale de la recherche ---------------------- */
-h1{font-family:var(--serif)!important;font-weight:600!important;
-   font-size:52px!important;line-height:1.06!important;
-   letter-spacing:-0.025em!important;color:var(--ink)!important;}
-h2{font-family:var(--serif)!important;font-weight:600!important;
-   font-size:26px!important;line-height:1.2!important;
-   letter-spacing:-0.02em!important;color:var(--ink)!important;}
-h3{font-family:var(--sans)!important;font-weight:600!important;
-   font-size:13px!important;letter-spacing:0.01em!important;
-   color:var(--ink-3)!important;text-transform:none!important;}
-
-/* --- Chiffres : le nombre commande la mise en page ----------------- */
-.num,[data-testid="stMetricValue"],
-[data-testid="stDataFrame"] td,[data-testid="stDataFrame"] th{
-  font-variant-numeric:tabular-nums lining-nums;}
-[data-testid="stMetricValue"]{
-  font-family:var(--serif)!important;font-weight:600!important;
-  font-size:38px!important;line-height:1!important;color:var(--ink)!important;}
-[data-testid="stMetricLabel"]{
-  font-family:var(--sans)!important;font-size:13px!important;
-  font-weight:600!important;color:var(--ink-3)!important;}
-
-/* Le delta d'une métrique est une donnée : vert et rouge y sont légitimes */
-[data-testid="stMetricDelta"] svg{display:none;}
-[data-testid="stMetricDelta"]{font-size:13.5px;font-variant-numeric:tabular-nums;}
-
-/* --- Tableaux ------------------------------------------------------ */
-[data-testid="stDataFrame"]{
-  border:1px solid var(--rule);border-radius:0;background:var(--surface);}
-[data-testid="stDataFrame"] td{font-size:13.5px;}
-[data-testid="stDataFrame"] th{
-  font-size:12px;font-weight:600;color:var(--ink-3);
-  border-bottom:2px solid var(--rule-strong)!important;}
-
-/* --- Onglets : laiton pour l'actif, jamais de vert ni de rouge ----- */
-.stTabs [data-baseweb="tab-list"]{gap:2px;border-bottom:1px solid var(--rule);}
-.stTabs [data-baseweb="tab"]{
-  font-family:var(--sans);font-size:14px;font-weight:500;
-  color:var(--ink-2);background:transparent;border-radius:0;
-  padding:8px 14px;}
+/* 2. Laiton pour l'actif : le rouge reste réservé aux données ------- */
 .stTabs [aria-selected="true"]{
-  color:var(--brass-ink)!important;
-  border-bottom:2px solid var(--brass)!important;background:transparent;}
+  color:#8A6A21 !important;
+}
+.stTabs [data-baseweb="tab-highlight"]{
+  background-color:#8A6A21 !important;
+}
+[data-testid="stMetricDelta"] svg{
+  display:none;                    /* la flèche double le signe déjà écrit */
+}
 
-/* --- Boutons : encre en primaire, laiton au survol ----------------- */
-.stButton>button{
-  font-family:var(--sans);font-size:14px;font-weight:500;
-  border-radius:var(--r-md);border:1px solid var(--rule-strong);
-  background:var(--surface);color:var(--ink);transition:all 120ms linear;}
-.stButton>button:hover{
-  border-color:var(--brass);color:var(--brass-ink);background:var(--brass-soft);}
-.stButton>button[kind="primary"]{
-  background:var(--ink);color:var(--paper);border-color:var(--ink);}
-.stButton>button[kind="primary"]:hover{
-  background:var(--brass-ink);border-color:var(--brass-ink);color:var(--paper);}
+/* 3. Couleurs sémantiques, réservées aux valeurs de performance ----- */
+.gain{color:#1F6B4D;}
+.loss{color:#A93226;}
+.flat{color:#797F7A;}
 
-/* --- Champs : focus laiton avec halo ------------------------------- */
-.stTextInput input,.stNumberInput input,.stSelectbox>div>div{
-  border-radius:var(--r-md)!important;border-color:var(--rule-strong)!important;
-  background:var(--paper)!important;font-family:var(--sans)!important;}
-.stTextInput input:focus,.stNumberInput input:focus{
-  border-color:var(--brass)!important;
-  box-shadow:0 0 0 3px var(--brass-soft)!important;}
-.stNumberInput input{text-align:right;font-variant-numeric:tabular-nums;}
-
-/* --- Identifiants : mono réservé aux tickers et horodatages -------- */
-code,.ticker,.isin{
-  font-family:var(--mono)!important;font-size:11.5px!important;
-  color:var(--ink-3)!important;background:transparent!important;}
-
-/* --- Couleurs de données : usage sémantique exclusif --------------- */
-.gain{color:var(--gain);}
-.loss{color:var(--loss);}
-.flat{color:var(--flat);}
-
-/* --- Pastilles d'état : pastille + mot ----------------------------- */
 .pastille{
   display:inline-flex;align-items:center;gap:6px;font-size:13px;
-  font-family:var(--sans);color:var(--ink-2);}
+}
 .pastille .point{
-  width:7px;height:7px;border-radius:50%;display:inline-block;}
-.pastille-gain .point{background:var(--gain);}
-.pastille-loss .point{background:var(--loss);}
-.pastille-brass .point{background:var(--brass);}
-.pastille-flat .point{background:var(--flat);}
+  width:7px;height:7px;border-radius:50%;display:inline-block;
+}
+.pastille-gain .point{background:#1F6B4D;}
+.pastille-loss .point{background:#A93226;}
+.pastille-brass .point{background:#8A6A21;}
+.pastille-flat .point{background:#797F7A;}
 
-/* --- Alertes : filet gauche, jamais de fond coloré vif ------------- */
-.stAlert{border-radius:0;border-left:3px solid var(--brass);
-  background:var(--surface);}
-
-/* --- Barre latérale ------------------------------------------------ */
-[data-testid="stSidebar"]{background:var(--sunk);border-right:1px solid var(--rule);}
-
-/* --- Rien ne bouge sans raison ------------------------------------- */
-*{animation-duration:0s!important;}
-@media (prefers-reduced-motion:reduce){*{transition:none!important;}}
+/* Identifiants techniques : ticker, ISIN, horodatage ---------------- */
+.ticker,.isin{
+  font-family:ui-monospace,"SF Mono",Consolas,monospace;
+  font-size:11.5px;opacity:0.7;
+}
 </style>
 """
 
-CONFIG_TOML = """[theme]
-base = "light"
+CONFIG_TOML = """# Seul l'accent est imposé : le laiton remplace le rouge de Streamlit,
+# qui doit rester disponible pour signifier une perte. Les fonds et la
+# police restent ceux de Streamlit, qui sont bons.
+[theme]
 primaryColor = "#8A6A21"
-backgroundColor = "#F0F0EB"
-secondaryBackgroundColor = "#FFFFFF"
-textColor = "#191C1A"
-font = "sans serif"
 
 [server]
 maxUploadSize = 20
