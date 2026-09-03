@@ -25,11 +25,13 @@ import assistant as asst
 import feuille as fe
 import fondamentaux as fo
 import indicateurs as ind
+import journal as jr
 import macro as mc
 import optimisation as opt
 import portefeuille as pf
 import previsions as pv
 import qualite as ql
+import these as th
 import univers as univ
 
 st.set_page_config(page_title="Portefeuille", page_icon="📊", layout="wide")
@@ -210,8 +212,20 @@ onglets = st.tabs([
     "Simulation et stress", "Backtest", "Analyse d'une valeur", "Données",
     "Screener", "Indicateurs", "Fondamentaux", "Résultats et consensus",
     "Macro et calendrier", "Qualité des données", "Assistant",
-    "Valeurs surveillées",
+    "Valeurs surveillées", "Journal", "Thèses",
 ])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_journal(url: str) -> pd.DataFrame:
+    """Journal de transactions depuis Google Sheets. Cache 5 min."""
+    return jr.lire(url)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_theses(url: str) -> pd.DataFrame:
+    """Thèses d'investissement depuis Google Sheets. Cache 5 min."""
+    return th.lire(url)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2377,3 +2391,324 @@ with onglets[15]:
                 calendrier_surv.assign(
                     Date=calendrier_surv["Date"].dt.strftime("%d/%m/%Y")),
                 use_container_width=True, hide_index=True)
+
+
+with onglets[16]:
+    st.subheader("Journal de transactions")
+    st.caption(
+        "La saisie des mouvements est la source unique de vérité : positions, "
+        "prix de revient, plus-values et performance en sont dérivés et "
+        "recalculés à chaque lecture. C'est ce qui rend possible le calcul du "
+        "PRU exact après un split et de la performance neutralisée des apports."
+    )
+
+    url_journal = ""
+    try:
+        url_journal = st.secrets.get("url_journal", "")
+    except Exception:
+        pass
+
+    ligne_haut = st.columns([4, 1])
+    url_journal = ligne_haut[0].text_input(
+        "Feuille du journal", value=url_journal,
+        placeholder="Adresse CSV de ta feuille de transactions…",
+        label_visibility="collapsed", key="url_journal")
+    if ligne_haut[1].button("Recharger", use_container_width=True,
+                            key="recharger_journal"):
+        lire_journal.clear()
+        st.rerun()
+
+    if not url_journal.strip():
+        st.info("Renseigne l'adresse de ta feuille, ou ajoute `url_journal` "
+                "dans les secrets Streamlit.")
+        with st.expander("Créer la feuille"):
+            st.markdown(
+                "Ajoute un onglet à ton classeur avec ces colonnes. Une ligne "
+                "par mouvement. Les types reconnus : **Versement**, **Retrait**, "
+                "**Achat**, **Vente**, **Dividende**, **Frais**, **Split**.\n\n"
+                "Pour un split, mets le ratio dans la colonne Quantité — 2 pour "
+                "un deux-pour-un. Pour un versement, le montant dans Prix."
+            )
+            st.dataframe(jr.MODELE, use_container_width=True, hide_index=True)
+        st.stop()
+
+    try:
+        with st.spinner("Lecture du journal…"):
+            mouvements = lire_journal(url_journal.strip())
+    except ValueError as erreur:
+        st.error(str(erreur))
+        st.stop()
+
+    if mouvements.empty:
+        st.warning("Aucun mouvement exploitable dans la feuille.")
+        st.stop()
+
+    anomalies = jr.controler(mouvements)
+    if anomalies:
+        st.error(f"{len(anomalies)} anomalie(s) détectée(s). Les calculs "
+                 "ci-dessous en tiennent compte mais peuvent être faussés.")
+        for anomalie in anomalies[:8]:
+            st.caption(f"Ligne {anomalie['ligne']} — {anomalie['message']}")
+
+    pos_journal, cessions = jr.positions(mouvements)
+    mouvements_espece = jr.flux(mouvements)
+
+    m = st.columns(4)
+    m[0].metric("Mouvements", len(mouvements))
+    m[1].metric("Lignes ouvertes", int((pos_journal["Quantité"] > 0).sum())
+                if not pos_journal.empty else 0)
+    m[2].metric("Versements nets",
+                fmt(float(mouvements_espece.sum()) if not mouvements_espece.empty
+                    else 0, 0, f" {devise_base}"))
+    m[3].metric("Plus-values réalisées",
+                fmt(float(pos_journal["Plus-value réalisée"].sum())
+                    if not pos_journal.empty else 0, 0, f" {devise_base}"))
+
+    st.markdown("**Positions reconstituées**")
+    st.caption(
+        "Prix de revient en coût moyen pondéré, méthode retenue par "
+        "l'administration fiscale française. Un split multiplie les quantités "
+        "et divise le prix de revient, sans créer de plus-value."
+    )
+    st.dataframe(pos_journal.round(4), use_container_width=True)
+    ia.bloc("Positions reconstituées", pos_journal,
+            "Positions dérivées du journal de transactions, avec prix de "
+            "revient exact et plus-values réalisées.", "positions_journal")
+
+    if not cessions.empty:
+        st.markdown("**Cessions réalisées**")
+        st.caption("Base de la déclaration de plus-values. Chaque cession "
+                   "porte son prix de revient au moment de la vente.")
+        st.dataframe(cessions.round(2), use_container_width=True,
+                     hide_index=True)
+        annee = st.selectbox(
+            "Année fiscale",
+            sorted({d.year for d in cessions["Date"]}, reverse=True),
+            key="annee_fiscale")
+        cessions_annee = cessions[cessions["Date"].dt.year == annee]
+        total_pv = float(cessions_annee["Plus-value"].sum())
+        st.metric(f"Plus-value nette {annee}",
+                  fmt(total_pv, 2, f" {devise_base}"),
+                  help="Somme des plus et moins-values de l'année. Les "
+                       "moins-values sont imputables sur les plus-values de "
+                       "même nature, sur dix ans.")
+        st.download_button(
+            f"Exporter les cessions {annee} (CSV)",
+            cessions_annee.to_csv(index=False).encode("utf-8"),
+            f"cessions_{annee}.csv", "text/csv")
+
+    st.divider()
+    st.subheader("Performance réelle")
+    st.caption(
+        "Le rendement pondéré par le temps neutralise l'effet des apports : "
+        "c'est la seule mesure comparable à un indice. Le taux de rendement "
+        "interne répond à une autre question — combien as-tu réellement gagné, "
+        "compte tenu du moment où tu as investi."
+    )
+
+    tickers_journal = [t for t in pos_journal.index if t]
+    if tickers_journal:
+        with st.spinner("Reconstitution de la valeur quotidienne…"):
+            cours_journal = charger_cours(tuple(tickers_journal), "5y", "1d")
+            serie_valeur = jr.valeurs_quotidiennes(mouvements, cours_journal)
+
+        if len(serie_valeur) > 2:
+            rendements_twr = jr.twr(serie_valeur, mouvements_espece)
+            perf_twr = float((1 + rendements_twr).prod() - 1) * 100
+            annees = len(rendements_twr) / 252
+            twr_annualise = (((1 + perf_twr / 100) ** (1 / annees) - 1) * 100
+                             if annees > 0.5 else np.nan)
+            taux_tri = jr.tri(mouvements_espece,
+                              float(serie_valeur.iloc[-1])) * 100
+
+            valeur_finale = float(serie_valeur.iloc[-1])
+            verse = float(mouvements_espece.sum()) if not mouvements_espece.empty else 0
+
+            p = st.columns(4)
+            p[0].metric("Valeur actuelle", fmt(valeur_finale, 0, f" {devise_base}"))
+            p[1].metric("TWR cumulé", fmt(perf_twr, 1, " %"),
+                        help="Performance des décisions d'investissement, "
+                             "indépendante du calendrier des apports.")
+            p[2].metric("TWR annualisé", fmt(twr_annualise, 1, " %"))
+            p[3].metric("TRI", fmt(taux_tri, 1, " %"),
+                        help="Performance réellement obtenue, sensible au "
+                             "moment des versements.")
+
+            if verse > 0:
+                apparent = (valeur_finale / verse - 1) * 100
+                if abs(apparent - perf_twr) > 3:
+                    st.info(
+                        f"L'écart mérite attention : rapportée aux versements, "
+                        f"la performance semble de {apparent:+.1f} %, alors que "
+                        f"le TWR ressort à {perf_twr:+.1f} %. La différence "
+                        "vient du calendrier des apports, pas de tes choix.")
+
+            comparaison = pd.DataFrame({
+                "Portefeuille": (1 + rendements_twr).cumprod() * 100 - 100})
+            if not rdt_bench.empty:
+                aligne = rdt_bench.reindex(rendements_twr.index).fillna(0)
+                comparaison[nom_indice] = (1 + aligne).cumprod() * 100 - 100
+            st.line_chart(comparaison, height=320)
+            st.caption("Base 100 au premier jour du journal, en pourcentage.")
+        else:
+            st.info("Historique trop court pour calculer la performance.")
+
+
+with onglets[17]:
+    st.subheader("Thèses d'investissement")
+    st.caption(
+        "Une thèse s'écrit avant l'achat, avec des conditions chiffrées de ce "
+        "qui la rendrait fausse. Le système les vérifie et signale l'écart au "
+        "moment où il apparaît, en rappelant le texte d'origine. Sans ce "
+        "rappel, une thèse se reformule inconsciemment pour coller aux faits."
+    )
+
+    url_these = ""
+    try:
+        url_these = st.secrets.get("url_theses", "")
+    except Exception:
+        pass
+
+    ligne_haut = st.columns([4, 1])
+    url_these = ligne_haut[0].text_input(
+        "Feuille des thèses", value=url_these,
+        placeholder="Adresse CSV de ta feuille de thèses…",
+        label_visibility="collapsed", key="url_theses")
+    if ligne_haut[1].button("Recharger", use_container_width=True,
+                            key="recharger_theses"):
+        lire_theses.clear()
+        st.rerun()
+
+    if not url_these.strip():
+        st.info("Renseigne l'adresse, ou ajoute `url_theses` dans les secrets.")
+        with st.expander("Créer la feuille"):
+            st.markdown(
+                "Une ligne par valeur. Les colonnes **Hypothèses** et "
+                "**Invalidation** doivent contenir des seuils chiffrés pour "
+                "être vérifiables — par exemple `marge nette > 24 % et "
+                "croissance > 5 %`.\n\n"
+                "Attention au sens : une hypothèse décrit ce qui doit rester "
+                "vrai, une invalidation décrit ce qui ne doit pas arriver."
+            )
+            st.dataframe(th.MODELE_THESE, use_container_width=True,
+                         hide_index=True)
+        st.stop()
+
+    try:
+        with st.spinner("Lecture des thèses…"):
+            theses = lire_theses(url_these.strip())
+    except ValueError as erreur:
+        st.error(str(erreur))
+        st.stop()
+
+    if theses.empty:
+        st.warning("Aucune thèse exploitable dans la feuille.")
+        st.stop()
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def mesures_fondamentales(ticker: str) -> dict:
+        """Chiffres nécessaires à la vérification des hypothèses. Cache 1 h."""
+        import resultats as rs
+        publie = rs.chiffres_publies(ticker)
+        mesures = {k: v for k, v in publie.items() if isinstance(v, (int, float))}
+        try:
+            infos = dict(yf.Ticker(ticker).info)
+            for cible, source in [("per", "trailingPE"),
+                                  ("roe_pct", "returnOnEquity"),
+                                  ("marge_brute_pct", "grossMargins"),
+                                  ("cours", "currentPrice")]:
+                valeur = infos.get(source)
+                if valeur is not None:
+                    mesures[cible] = (float(valeur) * 100
+                                      if cible.endswith("_pct") and abs(valeur) < 5
+                                      else float(valeur))
+        except Exception:
+            pass
+        return mesures
+
+    lancer = st.button("Vérifier toutes les thèses", type="primary")
+    if lancer or st.session_state.get("theses_verifiees"):
+        if lancer:
+            resultats_theses = {}
+            barre = st.progress(0.0)
+            for i, (ticker, ligne) in enumerate(theses.iterrows()):
+                mesures = mesures_fondamentales(ticker)
+                verdict = th.verifier(ligne.to_dict(), mesures)
+                cours_actuel = mesures.get("cours")
+                verdict["esperance"] = (th.esperance(ligne.to_dict(), cours_actuel)
+                                        if cours_actuel else {})
+                verdict["cours"] = cours_actuel
+                resultats_theses[ticker] = verdict
+                barre.progress((i + 1) / len(theses))
+            barre.empty()
+            st.session_state["theses_verifiees"] = resultats_theses
+
+        resultats_theses = st.session_state["theses_verifiees"]
+
+        compte = {}
+        for verdict in resultats_theses.values():
+            compte[verdict["statut"]] = compte.get(verdict["statut"], 0) + 1
+        s = st.columns(4)
+        s[0].metric("Intactes", compte.get("intacte", 0))
+        s[1].metric("Sous surveillance", compte.get("sous surveillance", 0))
+        s[2].metric("Invalidées", compte.get("invalidée", 0))
+        s[3].metric("Non vérifiables", compte.get("non vérifiable", 0))
+
+        ordre = {"invalidée": 0, "sous surveillance": 1, "intacte": 2,
+                 "non vérifiable": 3}
+        for ticker in sorted(resultats_theses,
+                             key=lambda t: ordre.get(resultats_theses[t]["statut"], 9)):
+            verdict = resultats_theses[ticker]
+            ligne = theses.loc[ticker]
+            pastille = {"intacte": "🟢", "sous surveillance": "🟡",
+                        "invalidée": "🔴", "non vérifiable": "⬜️"}[verdict["statut"]]
+
+            with st.expander(f"{pastille} {ticker} — {verdict['statut']}",
+                             expanded=verdict["statut"] == "invalidée"):
+                if ligne.get("raison"):
+                    st.markdown(f"*{ligne['raison']}*")
+
+                esp = verdict.get("esperance") or {}
+                if esp:
+                    e = st.columns(4)
+                    e[0].metric("Espérance", fmt(esp["esperance_pct"], 1, " %"))
+                    e[1].metric("Gain espéré", fmt(esp["gain_espere_pct"], 1, " %"))
+                    e[2].metric("Perte espérée", fmt(esp["perte_esperee_pct"], 1, " %"))
+                    e[3].metric("Asymétrie", fmt(esp.get("asymetrie"), 2))
+                    if esp["esperance_pct"] < 8:
+                        st.warning(
+                            "L'espérance est faible au regard du rendement "
+                            "historique d'un indice large : la sélection et le "
+                            "risque spécifique ne sont pas rémunérés.")
+
+                if verdict["hypotheses"]:
+                    st.markdown("**Hypothèses**")
+                    for h in verdict["hypotheses"]:
+                        marque = {"vérifiée": "✅", "démentie": "❌",
+                                  "non vérifiable": "⬜️"}[h["statut"]]
+                        valeur = ("n.c." if h["valeur"] is None
+                                  else f"{h['valeur']:.1f}")
+                        st.markdown(f"{marque} {h['libelle']} : **{valeur}** "
+                                    f"(seuil {h['operateur']}{h['seuil']:g})")
+
+                if verdict["invalidations"]:
+                    st.markdown("**Conditions de sortie**")
+                    for h in verdict["invalidations"]:
+                        declenchee = h["statut"] == "vérifiée"
+                        marque = "🔴" if declenchee else "⬜️" if h["valeur"] is None else "🟢"
+                        valeur = ("n.c." if h["valeur"] is None
+                                  else f"{h['valeur']:.1f}")
+                        st.markdown(f"{marque} {h['libelle']} : **{valeur}** "
+                                    f"(seuil {h['operateur']}{h['seuil']:g})"
+                                    + ("  ← **remplie**" if declenchee else ""))
+
+                if verdict["statut"] == "invalidée":
+                    st.error(
+                        "Une condition que tu as écrite toi-même est remplie. "
+                        f"Texte d'origine : « {ligne.get('invalidation', '')} »"
+                        + (f" — écrite le {pd.Timestamp(ligne['date']).strftime('%d/%m/%Y')}."
+                           if ligne.get("date") is not None else "."))
+
+                if verdict.get("a_revoir"):
+                    st.warning(f"Thèse non mise à jour depuis "
+                               f"{verdict['anciennete_jours']} jours.")
