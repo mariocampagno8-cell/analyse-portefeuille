@@ -34,11 +34,11 @@ import qualite as ql
 import these as th
 import univers as univ
 
-st.set_page_config(page_title="Portefeuille", page_icon="📊", layout="wide")
+st.set_page_config(page_title="FinexResearch", page_icon="◪", layout="wide")
 
 # Porte d'entrée : rien ne s'affiche tant que l'identification n'a pas réussi.
 # Désactivable en supprimant ces deux lignes si l'application reste privée.
-ac.porte("Analyse de portefeuille")
+ac.porte("FinexResearch")
 
 FICHIER_PORTEFEUILLE = Path(__file__).parent / "portefeuille.json"
 
@@ -209,7 +209,24 @@ st.sidebar.caption(
 # Saisie du portefeuille
 # --------------------------------------------------------------------------
 
-st.title("Analyse de portefeuille")
+# Monogramme : un simple carré partiellement rempli, tracé en SVG plutôt
+# qu'en image — aucun fichier à héberger, net à toute résolution.
+MONOGRAMME = """
+<svg width="34" height="34" viewBox="0 0 34 34" fill="none"
+     xmlns="http://www.w3.org/2000/svg" style="vertical-align:-7px">
+  <rect x="1.5" y="1.5" width="31" height="31" stroke="#8A6A21"
+        stroke-width="1.6"/>
+  <rect x="1.5" y="17" width="15.5" height="15.5" fill="#8A6A21"/>
+</svg>
+"""
+
+st.markdown(
+    f'<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:4px">'
+    f'{MONOGRAMME}'
+    f'<span style="font-size:34px;font-weight:600;letter-spacing:-0.02em">'
+    f'Finex<span style="color:#8A6A21">Research</span></span></div>',
+    unsafe_allow_html=True)
+st.caption("Poste de travail d'analyse de portefeuille")
 
 if "portefeuille" not in st.session_state:
     st.session_state.portefeuille = charger_portefeuille()
