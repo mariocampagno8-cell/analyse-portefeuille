@@ -21,6 +21,7 @@ from plotly.subplots import make_subplots
 import acces as ac
 import analyse as ia
 import analytics as an
+import charte as ch
 import assistant as asst
 import feuille as fe
 import fondamentaux as fo
@@ -35,6 +36,8 @@ import these as th
 import univers as univ
 
 st.set_page_config(page_title="Portefeuille", page_icon="📊", layout="wide")
+
+ch.appliquer(st)
 
 # Porte d'entrée : rien ne s'affiche tant que l'identification n'a pas réussi.
 # Désactivable en supprimant ces deux lignes si l'application reste privée.
@@ -133,10 +136,20 @@ def sans_doublons(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fmt(valeur, decimales=2, suffixe=""):
-    if valeur is None or (isinstance(valeur, float) and not np.isfinite(valeur)):
-        return "—"
-    return f"{valeur:,.{decimales}f}{suffixe}".replace(",", " ")
+def fmt(valeur, decimales: int = 2, unite: str = "") -> str:
+    """
+    Formatage conforme aux conventions de la charte.
+
+    Espace insécable fine pour les milliers, virgule décimale, moins
+    typographique, cadratin pour une donnée absente. L'unité détermine la
+    convention appliquée.
+    """
+    if unite.strip() == "%":
+        return ch.variation(valeur, decimales)
+    if unite.strip() in ("€", "$", "£") or unite.strip() == devise_base:
+        return ch.montant(valeur, unite.strip() or "€", decimales)
+    texte = ch.nombre(valeur, decimales)
+    return texte if texte == ch.CADRATIN or not unite else texte + ch.INSECABLE + unite.strip()
 
 
 # --------------------------------------------------------------------------
