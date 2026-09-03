@@ -1,8 +1,0 @@
-# Seul l'accent est imposé : le laiton remplace le rouge de Streamlit,
-# qui doit rester disponible pour signifier une perte. Les fonds et la
-# police restent ceux de Streamlit, qui sont bons.
-[theme]
-primaryColor = "#8A6A21"
-
-[server]
-maxUploadSize = 20
