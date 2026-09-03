@@ -228,6 +228,32 @@ st.caption("Poste de travail d'analyse de portefeuille")
 if "portefeuille" not in st.session_state:
     st.session_state.portefeuille = charger_portefeuille()
 
+# Ces valeurs sont calculées dans l'onglet Portefeuille et partagées avec les
+# autres. Elles sont initialisées ici pour que chaque onglet puisse vérifier
+# leur disponibilité plutôt que d'échouer sur une variable inexistante.
+val = None
+poids = None
+rdt = None
+rdt_bench = None
+freq = None
+rdt_ptf = None
+cov = None
+total = None
+cours = None
+reg = None
+edite = None
+
+
+def portefeuille_pret() -> bool:
+    """Vrai si l'onglet Portefeuille a pu charger et valoriser les positions."""
+    return val is not None and not val.empty
+
+
+def message_prealable() -> None:
+    st.info("Charge d'abord ton portefeuille dans l'onglet **Portefeuille** : "
+            "les mesures de cet onglet en dépendent.")
+
+
 onglets = st.tabs([
     "Portefeuille", "Journal", "Thèses", "Valeur", "Surveillance",
     "Risque", "Simulateur",
@@ -258,7 +284,8 @@ def lire_feuille(url: str) -> pd.DataFrame:
     return fe.lire(url)
 
 
-with onglets[0]:
+def _onglet_0():
+    global val, poids, rdt, rdt_bench, freq, rdt_ptf, cov, total, cours, reg, edite
     if source == "Google Sheets":
         if not url_feuille:
             st.info(
@@ -273,14 +300,14 @@ with onglets[0]:
                 fe.MODELE.to_csv(index=False).encode("utf-8"),
                 "modele_portefeuille.csv", "text/csv",
             )
-            st.stop()
+            return
 
         try:
             with st.spinner("Lecture de la feuille…"):
                 depuis_feuille = lire_feuille(url_feuille)
         except ValueError as erreur:
             st.error(str(erreur))
-            st.stop()
+            return
 
         st.success(f"{len(depuis_feuille)} ligne(s) lue(s) depuis Google Sheets.")
         for alerte in fe.diagnostic(depuis_feuille):
@@ -336,7 +363,7 @@ with onglets[0]:
 
     if lignes.empty:
         st.info("Ajoute au moins une ligne pour lancer les calculs.")
-        st.stop()
+        return
 
     tickers = tuple(dict.fromkeys(lignes["Ticker"]))
     cours = charger_cours(tickers + (benchmark,), periode, intervalle)
@@ -350,7 +377,7 @@ with onglets[0]:
 
     if lignes.empty or benchmark not in cours.columns:
         st.error("Pas assez de données pour continuer.")
-        st.stop()
+        return
 
     # Valorisation, avec conversion dans la devise de reference
     valorisation = []
@@ -642,8 +669,11 @@ with onglets[0]:
                     "portefeuille de sa cible sans aucune vente."
                     .replace(",", " "))
 
+with onglets[0]:
+    _onglet_0()
 
-with onglets[1]:
+
+def _onglet_1():
     st.subheader("Journal de transactions")
     st.caption(
         "La saisie des mouvements est la source unique de vérité : positions, "
@@ -680,18 +710,18 @@ with onglets[1]:
                 "un deux-pour-un. Pour un versement, le montant dans Prix."
             )
             st.dataframe(jr.MODELE, use_container_width=True, hide_index=True)
-        st.stop()
+        return
 
     try:
         with st.spinner("Lecture du journal…"):
             mouvements = lire_journal(url_journal.strip())
     except ValueError as erreur:
         st.error(str(erreur))
-        st.stop()
+        return
 
     if mouvements.empty:
         st.warning("Aucun mouvement exploitable dans la feuille.")
-        st.stop()
+        return
 
     anomalies = jr.controler(mouvements)
     if anomalies:
@@ -803,8 +833,11 @@ with onglets[1]:
         else:
             st.info("Historique trop court pour calculer la performance.")
 
+with onglets[1]:
+    _onglet_1()
 
-with onglets[2]:
+
+def _onglet_2():
     st.subheader("Thèses d'investissement")
     st.caption(
         "Une thèse s'écrit avant l'achat, avec des conditions chiffrées de ce "
@@ -842,18 +875,18 @@ with onglets[2]:
             )
             st.dataframe(th.MODELE_THESE, use_container_width=True,
                          hide_index=True)
-        st.stop()
+        return
 
     try:
         with st.spinner("Lecture des thèses…"):
             theses = lire_theses(url_these.strip())
     except ValueError as erreur:
         st.error(str(erreur))
-        st.stop()
+        return
 
     if theses.empty:
         st.warning("Aucune thèse exploitable dans la feuille.")
-        st.stop()
+        return
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def mesures_fondamentales(ticker: str) -> dict:
@@ -963,8 +996,15 @@ with onglets[2]:
                     st.warning(f"Thèse non mise à jour depuis "
                                f"{verdict['anciennete_jours']} jours.")
 
+with onglets[2]:
+    _onglet_2()
 
-with onglets[3]:
+
+def _onglet_3():
+    if not portefeuille_pret():
+        message_prealable()
+        return
+
     st.subheader("Analyse d'une valeur")
     st.caption(
         "Tout ce qui concerne une société, au même endroit : le cours et sa "
@@ -1452,8 +1492,11 @@ with onglets[3]:
                                  columns=["Suffixe", "Place"]),
                     use_container_width=True, hide_index=True, height=300)
 
+with onglets[3]:
+    _onglet_3()
 
-with onglets[4]:
+
+def _onglet_4():
     st.subheader("Valeurs surveillées")
 
     url_surv = ""
@@ -1491,14 +1534,14 @@ with onglets[4]:
             )
             st.dataframe(fe.MODELE_SURVEILLANCE, use_container_width=True,
                          hide_index=True)
-        st.stop()
+        return
 
     try:
         with st.spinner("Lecture de la feuille…"):
             surveillees = lire_liste_surveillance(url_surv.strip())
     except ValueError as erreur:
         st.error(str(erreur))
-        st.stop()
+        return
 
     st.caption(f"{len(surveillees)} valeur(s) suivie(s), lues depuis ta feuille. "
                "Modifie-la depuis ton téléphone puis clique sur Recharger.")
@@ -1560,7 +1603,7 @@ with onglets[4]:
     if tableau_surv.empty:
         st.error("Aucune donnée exploitable. Vérifie tes tickers sur "
                  "finance.yahoo.com.")
-        st.stop()
+        return
 
     introuvables = [t for t in surveillees if t not in tableau_surv.index]
     if introuvables:
@@ -1655,8 +1698,15 @@ with onglets[4]:
                     Date=calendrier_surv["Date"].dt.strftime("%d/%m/%Y")),
                 use_container_width=True, hide_index=True)
 
+with onglets[4]:
+    _onglet_4()
 
-with onglets[5]:
+
+def _onglet_5():
+    if not portefeuille_pret():
+        message_prealable()
+        return
+
     st.subheader("Risque")
     st.caption(
         "Trois façons de regarder la même question : d'où vient le risque, "
@@ -1849,8 +1899,15 @@ with onglets[5]:
             use_container_width=True, hide_index=True,
         )
 
+with onglets[5]:
+    _onglet_5()
 
-with onglets[6]:
+
+def _onglet_6():
+    if not portefeuille_pret():
+        message_prealable()
+        return
+
     st.subheader("Simulateur de portefeuille")
     st.caption(
         "Construis un portefeuille librement et mesure ce qu'il aurait donné. "
@@ -1925,7 +1982,7 @@ with onglets[6]:
 
     if propre.empty:
         st.warning("Ajoute au moins une ligne pour lancer la simulation.")
-        st.stop()
+        return
 
     tickers_sim = [str(t).strip().upper() for t in propre["Ticker"]]
     poids_bruts = pd.Series(
@@ -1933,7 +1990,7 @@ with onglets[6]:
         index=tickers_sim)
     if poids_bruts.sum() <= 0:
         st.error("La somme des poids doit être positive.")
-        st.stop()
+        return
     poids_sim = poids_bruts / poids_bruts.sum()
 
     if abs(poids_bruts.sum() - 100) > 0.5:
@@ -1950,13 +2007,13 @@ with onglets[6]:
                    "l'orthographe exacte sur finance.yahoo.com.")
         tickers_sim = [t for t in tickers_sim if t in cours_sim.columns]
         if not tickers_sim:
-            st.stop()
+            return
         poids_sim = poids_sim[tickers_sim] / poids_sim[tickers_sim].sum()
 
     rdt_sim = cours_sim[tickers_sim].pct_change().dropna()
     if len(rdt_sim) < 60:
         st.error("Historique trop court pour une mesure exploitable.")
-        st.stop()
+        return
 
     # --- Reconstitution de la trajectoire
     if rebalancement == "Aucun":
@@ -2069,3 +2126,7 @@ with onglets[6]:
         "Exporter la simulation (CSV)",
         trajectoire.to_csv().encode("utf-8"),
         "simulation.csv", "text/csv")
+
+with onglets[6]:
+    _onglet_6()
+
