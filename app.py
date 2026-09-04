@@ -1927,8 +1927,75 @@ def _onglet_4():
                 "par du risque supplémentaire — reste à savoir si tu l'aurais "
                 "supporté.")
 
-        detail = st.selectbox("Voir la répartition", list(allocations),
-                              key="detail_alloc")
+        # --- Comparaison visuelle des répartitions
+        st.markdown("**Comparer les répartitions**")
+        st.caption(
+            "Chaque colonne est une méthode, chaque couleur une valeur. "
+            "L'intérêt de ce graphique n'est pas de trouver la « bonne » "
+            "répartition mais de voir à quel point les méthodes divergent : "
+            "un désaccord marqué signale que le résultat dépend surtout de "
+            "l'estimation, pas des données."
+        )
+
+        a_comparer = st.multiselect(
+            "Méthodes affichées", list(allocations),
+            default=[m for m in ("Ma composition", "Variance minimale",
+                                 "Sharpe maximal", "Équipondéré")
+                     if m in allocations],
+            key="comparer_alloc")
+
+        if a_comparer:
+            poids_compares = pd.DataFrame(
+                {nom: allocations[nom].reindex(tickers_sim).fillna(0) * 100
+                 for nom in a_comparer}, index=tickers_sim)
+
+            # Barres empilées : chaque colonne totalise 100 %, ce qui rend la
+            # comparaison directe d'une méthode à l'autre.
+            st.bar_chart(poids_compares.T, height=340, stack=True)
+
+            st.dataframe(poids_compares.T.round(1), use_container_width=True)
+
+            # Écart maximal entre méthodes, ligne par ligne : c'est là que se
+            # loge le désaccord entre les optimiseurs.
+            dispersion = (poids_compares.max(axis=1)
+                          - poids_compares.min(axis=1)).sort_values(
+                              ascending=False)
+            e = st.columns(3)
+            e[0].metric("Ligne la plus disputée", dispersion.index[0],
+                        fmt(dispersion.iloc[0], 0, " pt d'écart"))
+            e[1].metric("Écart moyen entre méthodes",
+                        fmt(float(dispersion.mean()), 1, " pt"))
+            concentration = poids_compares.max(axis=0)
+            e[2].metric("Méthode la plus concentrée",
+                        concentration.idxmax(),
+                        fmt(float(concentration.max()), 0, " % sur une ligne"))
+
+            if float(dispersion.mean()) > 15:
+                st.info(
+                    "Les méthodes divergent fortement. Quand des optimiseurs "
+                    "aboutissent à des répartitions très différentes sur les "
+                    "mêmes données, c'est que le résultat dépend surtout des "
+                    "hypothèses de chacun — pas d'une vérité que les données "
+                    "contiendraient. Une répartition simple devient alors "
+                    "défendable.")
+
+        # --- Rendement contre risque
+        st.markdown("**Rendement contre risque**")
+        nuage_methodes = pd.DataFrame({
+            "Volatilité (%)": tableau_opt["Volatilité (%)"],
+            "Perf. annualisée (%)": tableau_opt["Perf. annualisée (%)"],
+        })
+        st.scatter_chart(nuage_methodes, x="Volatilité (%)",
+                         y="Perf. annualisée (%)", height=320)
+        st.caption(
+            "Chaque point est une méthode. Plus un point est haut et à "
+            "gauche, meilleur est son rapport — sur la période observée. "
+            "Les points élevés proviennent presque toujours de méthodes qui "
+            "estiment des rendements attendus."
+        )
+
+        st.markdown("**Détail d'une répartition**")
+        detail = st.selectbox("Méthode", list(allocations), key="detail_alloc")
         st.caption(explications.get(detail, ""))
         repartition = (allocations[detail].reindex(tickers_sim).fillna(0) * 100)
         st.bar_chart(repartition.rename("Poids (%)"), height=240)
