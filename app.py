@@ -1775,6 +1775,8 @@ def _onglet_4():
                 fmt(decompo_sim["Part du risque (%)"].max(), 0, " %")
                 if not decompo_sim.empty else None)
 
+    st.divider()
+    st.markdown("**Lecture de cette simulation**")
     ia.bloc("Simulation de portefeuille",
             pd.concat([decompo_sim,
                        pd.DataFrame({"Mesure": ["Perf. annualisée", "Volatilité",
@@ -1783,13 +1785,205 @@ def _onglet_4():
                                                 sharpe_sim, dd_sim]}
                                     ).set_index("Mesure")], axis=0),
             f"Portefeuille fictif de {len(tickers_sim)} lignes sur "
-            f"{periode_sim}, rééquilibrage {rebalancement.lower()}.",
-            "simulateur")
+            f"{periode_sim}, rééquilibrage {rebalancement.lower()}, capital "
+            f"de {capital_sim:.0f} {devise_base}.",
+            "simulateur", ouvert=True, automatique=True,
+            consignes=ia.CONSIGNES_PORTEFEUILLE)
 
     st.download_button(
         "Exporter la simulation (CSV)",
         trajectoire.to_csv().encode("utf-8"),
         "simulation.csv", "text/csv")
+
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("Allocations optimales")
+    st.caption(
+        "Six façons de répartir les mêmes valeurs, calculées sur la période "
+        "choisie, comparées à ta composition."
+    )
+
+    st.warning(
+        "Avertissement décisif sur ces chiffres. Ces allocations sont "
+        "optimisées SUR LA PÉRIODE AFFICHÉE : elles connaissent son résultat. "
+        "Leur performance passée est donc flatteuse par construction et ne "
+        "dit rien de l'avenir.\n\n"
+        "La distinction qui compte : les méthodes qui maximisent le rendement "
+        "reposent sur des rendements attendus, quantité que personne ne sait "
+        "estimer — une erreur de 1 % sur une espérance déplace les poids de "
+        "dizaines de points. Les méthodes qui minimisent le risque ne "
+        "dépendent que de la covariance, bien plus stable dans le temps. "
+        "C'est pourquoi la variance minimale et la parité de risque tiennent "
+        "hors échantillon, là où le Sharpe maximal se dégrade presque "
+        "toujours.",
+        icon="⚠️")
+
+    if len(tickers_sim) < 2:
+        st.info("Au moins deux lignes sont nécessaires pour optimiser.")
+    else:
+        cov_opt, _ = opt.covariance_retrecie(rdt_sim, freq=252)
+        mu_opt = opt.rendements_attendus(rdt_sim, methode="retreci", freq=252)
+
+        allocations = {"Ma composition": poids_sim}
+        methodes = [
+            ("Variance minimale", lambda: opt.variance_minimale(cov_opt),
+             "Le risque le plus faible possible. Ne dépend que de la "
+             "covariance, donc la plus robuste hors échantillon."),
+            ("Parité de risque", lambda: opt.parite_de_risque(cov_opt),
+             "Chaque ligne contribue également au risque total. Bon "
+             "compromis entre robustesse et diversification."),
+            ("Sharpe maximal", lambda: opt.sharpe_maximal(mu_opt, cov_opt,
+                                                          taux_sans_risque),
+             "Le meilleur rendement par unité de risque — sur le passé. "
+             "Très sensible aux erreurs d'estimation."),
+            ("Diversification maximale",
+             lambda: opt.diversification_maximale(cov_opt),
+             "Maximise l'écart entre la volatilité moyenne des lignes et "
+             "celle du portefeuille."),
+            ("HRP", lambda: opt.hrp(cov_opt),
+             "Répartition hiérarchique par grappes de corrélation. Ne "
+             "requiert aucune inversion de matrice, donc stable."),
+            ("Équipondéré",
+             lambda: pd.Series(1 / len(tickers_sim), index=tickers_sim),
+             "Référence difficile à battre, et sans aucun paramètre à "
+             "estimer."),
+        ]
+
+        explications = {"Ma composition": "Les poids que tu as saisis."}
+        with st.spinner("Optimisation…"):
+            for nom, calcul, explication in methodes:
+                try:
+                    allocations[nom] = calcul()
+                    explications[nom] = explication
+                except Exception as erreur:
+                    st.caption(f"{nom} non calculable : {erreur}")
+
+        def _mesurer(poids_test: pd.Series) -> dict:
+            """Rejoue la même simulation avec une autre répartition."""
+            poids_test = poids_test.reindex(tickers_sim).fillna(0)
+            if poids_test.sum() <= 0:
+                return {}
+            poids_test = poids_test / poids_test.sum()
+
+            if rebalancement == "Aucun":
+                parts_test = (capital_sim * poids_test) / cours_sim[tickers_sim].iloc[0]
+                serie = (cours_sim[tickers_sim] * parts_test).sum(axis=1)
+                r_test = serie.pct_change().dropna()
+            else:
+                frequence_test = 63 if rebalancement == "Trimestriel" else 252
+                r_test = pd.Series(index=rdt_sim.index, dtype=float)
+                courants = poids_test.copy()
+                for i, (date, ligne) in enumerate(rdt_sim.iterrows()):
+                    r_test.loc[date] = float((courants * ligne).sum())
+                    courants = courants * (1 + ligne)
+                    courants /= courants.sum()
+                    if (i + 1) % frequence_test == 0:
+                        courants = poids_test.copy()
+
+            duree = len(r_test) / 252
+            cumul = float((1 + r_test).prod() - 1) * 100
+            return {
+                "Perf. annualisée (%)": (((1 + cumul / 100) ** (1 / duree) - 1) * 100
+                                         if duree > 0.5 else np.nan),
+                "Volatilité (%)": an.volatilite(r_test) * 100,
+                "Sharpe": an.sharpe(r_test, taux_sans_risque),
+                "Perte max (%)": an.drawdown_max(r_test) * 100,
+                "Lignes effectives": an.nombre_effectif_lignes(poids_test),
+                "Poids max (%)": float(poids_test.max()) * 100,
+            }
+
+        comparaison = {}
+        for nom, poids_test in allocations.items():
+            mesures = _mesurer(poids_test)
+            if mesures:
+                comparaison[nom] = mesures
+
+        tableau_opt = pd.DataFrame(comparaison).T
+        tri_opt = st.selectbox(
+            "Trier par", list(tableau_opt.columns), index=2, key="tri_optim")
+        croissant = tri_opt in ("Volatilité (%)", "Poids max (%)")
+        st.dataframe(
+            tableau_opt.sort_values(tri_opt, ascending=croissant).round(2),
+            use_container_width=True)
+
+        meilleure_vol = tableau_opt["Volatilité (%)"].idxmin()
+        meilleur_sharpe = tableau_opt["Sharpe"].idxmax()
+        meilleure_perf = tableau_opt["Perf. annualisée (%)"].idxmax()
+
+        v = st.columns(3)
+        v[0].metric("Risque le plus faible", meilleure_vol,
+                    fmt(tableau_opt.loc[meilleure_vol, "Volatilité (%)"], 1, " %"))
+        v[1].metric("Meilleur rendement", meilleure_perf,
+                    fmt(tableau_opt.loc[meilleure_perf, "Perf. annualisée (%)"],
+                        1, " %"))
+        v[2].metric("Meilleur rapport", meilleur_sharpe,
+                    fmt(tableau_opt.loc[meilleur_sharpe, "Sharpe"], 2))
+
+        if meilleure_perf != meilleur_sharpe:
+            st.info(
+                f"L'allocation la plus performante ({meilleure_perf}) n'est "
+                f"pas celle au meilleur rapport rendement-risque "
+                f"({meilleur_sharpe}). Le rendement supplémentaire a été payé "
+                "par du risque supplémentaire — reste à savoir si tu l'aurais "
+                "supporté.")
+
+        detail = st.selectbox("Voir la répartition", list(allocations),
+                              key="detail_alloc")
+        st.caption(explications.get(detail, ""))
+        repartition = (allocations[detail].reindex(tickers_sim).fillna(0) * 100)
+        st.bar_chart(repartition.rename("Poids (%)"), height=240)
+
+        if st.button("Reprendre cette allocation dans la simulation"):
+            st.session_state.simulation = pd.DataFrame({
+                "Ticker": tickers_sim,
+                "Poids (%)": [float(repartition[t]) for t in tickers_sim]})
+            st.rerun()
+
+        # --- Frontière efficiente
+        st.markdown("**Frontière efficiente**")
+        st.caption(
+            "Chaque point est un portefeuille possible. La courbe joint ceux "
+            "qui offrent le meilleur rendement pour un risque donné — sur la "
+            "période observée uniquement."
+        )
+        try:
+            frontiere = opt.frontiere_efficiente(mu_opt, cov_opt, points=30)
+            if not frontiere.empty:
+                nuage = pd.DataFrame({
+                    "Volatilité (%)": frontiere["volatilite"] * 100,
+                    "Frontière": frontiere["rendement"] * 100}).set_index(
+                        "Volatilité (%)")
+                positions = pd.DataFrame({
+                    "Volatilité (%)": tableau_opt["Volatilité (%)"],
+                    "Allocations": tableau_opt["Perf. annualisée (%)"]}
+                    ).set_index("Volatilité (%)")
+                st.line_chart(nuage.join(positions, how="outer").sort_index(),
+                              height=320)
+                st.caption(
+                    "Les points « Allocations » situent chaque méthode. Une "
+                    "allocation nettement sous la courbe laisse du rendement "
+                    "sur la table pour le même risque — mais souviens-toi que "
+                    "la courbe elle-même est tracée en connaissant le passé."
+                )
+        except Exception as erreur:
+            st.caption(f"Frontière non calculable : {erreur}")
+
+        st.markdown("**Lecture de ces allocations**")
+        detail_poids = pd.DataFrame(
+            {nom: p.reindex(tickers_sim).fillna(0) * 100
+             for nom, p in allocations.items()}).round(1)
+        ia.bloc("Allocations optimales",
+                {"mesures": tableau_opt.round(2).to_dict("index"),
+                 "poids_par_methode": detail_poids.to_dict(),
+                 "correlation_moyenne": round(float(correlation_moyenne), 2),
+                 "periode": periode_sim,
+                 "rebalancement": rebalancement},
+                f"Comparaison de {len(comparaison)} répartitions des mêmes "
+                f"{len(tickers_sim)} valeurs sur {periode_sim}. Les "
+                "optimisations connaissent le résultat de la période : leur "
+                "performance passée est flatteuse par construction.",
+                "allocations_sim", ouvert=True, automatique=True,
+                consignes=ia.CONSIGNES_PORTEFEUILLE)
 
 with onglets[4]:
     _onglet_4()

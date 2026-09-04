@@ -78,6 +78,46 @@ pas de formule d'introduction. Commence directement par l'élément le plus \
 important. Écris comme un analyste qui parle à un collègue."""
 
 
+CONSIGNES_PORTEFEUILLE = """Tu commentes la construction d'un portefeuille \
+pour un investisseur particulier français qui connaît les bases.
+
+RÈGLES ABSOLUES
+Ne calcule rien : tous les chiffres sont fournis.
+N'affirme rien qui ne soit dans les données. Tu ignores l'actualité et les \
+raisons des mouvements passés.
+
+CE QUE TU DIS, dans cet ordre
+
+1. LE COMPROMIS. Quelle allocation offre quoi, en une phrase par option qui \
+mérite d'être mentionnée. Compare rendement ET risque : citer une performance \
+sans sa volatilité et sa perte maximale est trompeur.
+
+2. LA MISE EN GARDE SUR L'OPTIMISATION. Ces allocations sont calculées sur la \
+période affichée, donc en connaissant son résultat. Rappelle que les méthodes \
+maximisant le rendement reposent sur des rendements attendus, impossibles à \
+estimer de façon fiable, alors que celles minimisant le risque ne dépendent \
+que de la covariance, bien plus stable. Signale-le systématiquement quand une \
+allocation à fort rendement apparaît en tête.
+
+3. CE QUI SAUTE AUX YEUX DANS LA STRUCTURE. Concentration excessive sur une \
+ligne, nombre de lignes effectives très inférieur au nombre de positions, \
+corrélations élevées, perte maximale difficile à supporter.
+
+4. CONCRÈTEMENT. Une ou deux actions : quelle allocation examiner de plus \
+près et pourquoi, quelle vérification faire, quelle question trancher. Indique \
+toujours l'effet attendu ET la limite.
+
+CE QUE TU NE FAIS JAMAIS
+Ne désigne pas une allocation comme « la meilleure » : elle l'est sur le passé, \
+ce qui ne se transpose pas.
+Ne recommande pas d'acheter ou de vendre une valeur précise.
+Ne prédis aucune performance future.
+
+FORME
+Cinq à sept phrases, en prose, sans liste ni titre. Commence par le compromis \
+principal."""
+
+
 # ==========================================================================
 # Sérialisation et empreinte
 # ==========================================================================
@@ -123,7 +163,7 @@ def _empreinte(titre: str, contenu: str, contexte: str) -> str:
 
 @st.cache_data(ttl=86400, show_spinner=False, max_entries=200)
 def _generer(empreinte: str, titre: str, contenu: str, contexte: str,
-             modele: str, cle: str) -> str:
+             modele: str, cle: str, consignes: str = "") -> str:
     """
     Produit l'analyse. Cache 24 h, indexe sur l'empreinte des donnees.
 
@@ -145,7 +185,7 @@ def _generer(empreinte: str, titre: str, contenu: str, contexte: str,
                    "unique de 30 %.\n\n"
                    f"Données :\n```json\n{contenu}\n```")
         reponse = client.messages.create(
-            model=modele, max_tokens=700, system=CONSIGNES,
+            model=modele, max_tokens=700, system=consignes or CONSIGNES,
             messages=[{"role": "user", "content": message}])
         return "".join(b.text for b in reponse.content
                        if getattr(b, "type", "") == "text").strip()
@@ -165,7 +205,8 @@ def _generer(empreinte: str, titre: str, contenu: str, contexte: str,
 # ==========================================================================
 
 def bloc(titre: str, donnees, contexte: str = "", cle_widget: str = "",
-         ouvert: bool = False) -> None:
+         ouvert: bool = False, automatique: bool = False,
+         consignes: str = "") -> None:
     """
     Affiche un bloc d'analyse repliable sous un tableau.
 
@@ -181,7 +222,7 @@ def bloc(titre: str, donnees, contexte: str = "", cle_widget: str = "",
     if not cle_api:
         return                                   # silencieux : pas de clé, pas de bloc
 
-    automatique = st.session_state.get("analyses_auto", False)
+    automatique = automatique or st.session_state.get("analyses_auto", False)
     modele = st.session_state.get("modele_analyses", MODELE_DEFAUT)
 
     contenu = _serialiser(donnees)
@@ -202,7 +243,8 @@ def bloc(titre: str, donnees, contexte: str = "", cle_widget: str = "",
                 return
 
         with st.spinner("Analyse…"):
-            texte = _generer(empreinte, titre, contenu, contexte, modele, cle_api)
+            texte = _generer(empreinte, titre, contenu, contexte, modele,
+                             cle_api, consignes)
         st.session_state[f"analyse_{empreinte}"] = texte
 
         if texte.startswith("ERREUR"):
