@@ -1927,71 +1927,85 @@ def _onglet_4():
                 "par du risque supplémentaire — reste à savoir si tu l'aurais "
                 "supporté.")
 
-        # --- Comparaison visuelle des répartitions
-        st.markdown("**Comparer les répartitions**")
+        # --- Courbes de progression
+        st.markdown("**Progression comparée**")
         st.caption(
-            "Chaque colonne est une méthode, chaque couleur une valeur. "
-            "L'intérêt de ce graphique n'est pas de trouver la « bonne » "
-            "répartition mais de voir à quel point les méthodes divergent : "
-            "un désaccord marqué signale que le résultat dépend surtout de "
-            "l'estimation, pas des données."
+            "La trajectoire de chaque allocation sur la période, à partir du "
+            "même capital. Ce n'est pas le point d'arrivée qui compte le "
+            "plus, mais le chemin : deux courbes finissant au même niveau "
+            "n'ont pas été également supportables."
         )
 
         a_comparer = st.multiselect(
-            "Méthodes affichées", list(allocations),
+            "Allocations affichées", list(allocations),
             default=[m for m in ("Ma composition", "Variance minimale",
                                  "Sharpe maximal", "Équipondéré")
                      if m in allocations],
             key="comparer_alloc")
 
         if a_comparer:
-            poids_compares = pd.DataFrame(
-                {nom: allocations[nom].reindex(tickers_sim).fillna(0) * 100
-                 for nom in a_comparer}, index=tickers_sim)
+            courbes = {}
+            for nom in a_comparer:
+                poids_c = allocations[nom].reindex(tickers_sim).fillna(0)
+                if poids_c.sum() <= 0:
+                    continue
+                poids_c = poids_c / poids_c.sum()
 
-            # Barres empilées : chaque colonne totalise 100 %, ce qui rend la
-            # comparaison directe d'une méthode à l'autre.
-            st.bar_chart(poids_compares.T, height=340, stack=True)
+                if rebalancement == "Aucun":
+                    parts_c = (capital_sim * poids_c) / cours_sim[tickers_sim].iloc[0]
+                    courbes[nom] = (cours_sim[tickers_sim] * parts_c).sum(axis=1)
+                else:
+                    frequence_c = 63 if rebalancement == "Trimestriel" else 252
+                    serie_c = pd.Series(index=rdt_sim.index, dtype=float)
+                    courants_c = poids_c.copy()
+                    for i, (date_c, ligne_c) in enumerate(rdt_sim.iterrows()):
+                        serie_c.loc[date_c] = float((courants_c * ligne_c).sum())
+                        courants_c = courants_c * (1 + ligne_c)
+                        courants_c /= courants_c.sum()
+                        if (i + 1) % frequence_c == 0:
+                            courants_c = poids_c.copy()
+                    courbes[nom] = capital_sim * (1 + serie_c).cumprod()
 
-            st.dataframe(poids_compares.T.round(1), use_container_width=True)
+            if courbes:
+                st.line_chart(pd.DataFrame(courbes), height=360)
+                st.caption(f"Valeur d'un capital de {capital_sim:,.0f} "
+                           f"{devise_base}.".replace(",", " "))
 
-            # Écart maximal entre méthodes, ligne par ligne : c'est là que se
-            # loge le désaccord entre les optimiseurs.
-            dispersion = (poids_compares.max(axis=1)
-                          - poids_compares.min(axis=1)).sort_values(
-                              ascending=False)
-            e = st.columns(3)
-            e[0].metric("Ligne la plus disputée", dispersion.index[0],
-                        fmt(dispersion.iloc[0], 0, " pt d'écart"))
-            e[1].metric("Écart moyen entre méthodes",
-                        fmt(float(dispersion.mean()), 1, " pt"))
-            concentration = poids_compares.max(axis=0)
-            e[2].metric("Méthode la plus concentrée",
-                        concentration.idxmax(),
-                        fmt(float(concentration.max()), 0, " % sur une ligne"))
+                st.markdown("**Pertes depuis le plus haut**")
+                st.caption("Le creux le plus profond est ce qui décide si une "
+                           "allocation est tenable dans la durée.")
+                pertes = pd.DataFrame({
+                    nom: an.courbe_drawdown(serie.pct_change().dropna()) * 100
+                    for nom, serie in courbes.items()})
+                st.line_chart(pertes, height=280)
 
-            if float(dispersion.mean()) > 15:
-                st.info(
-                    "Les méthodes divergent fortement. Quand des optimiseurs "
-                    "aboutissent à des répartitions très différentes sur les "
-                    "mêmes données, c'est que le résultat dépend surtout des "
-                    "hypothèses de chacun — pas d'une vérité que les données "
-                    "contiendraient. Une répartition simple devient alors "
-                    "défendable.")
-
-        # --- Rendement contre risque
-        st.markdown("**Rendement contre risque**")
-        nuage_methodes = pd.DataFrame({
-            "Volatilité (%)": tableau_opt["Volatilité (%)"],
-            "Perf. annualisée (%)": tableau_opt["Perf. annualisée (%)"],
-        })
-        st.scatter_chart(nuage_methodes, x="Volatilité (%)",
-                         y="Perf. annualisée (%)", height=320)
+        # --- Risque à gauche, rendement à droite
+        st.markdown("**Risque et rendement, méthode par méthode**")
         st.caption(
-            "Chaque point est une méthode. Plus un point est haut et à "
-            "gauche, meilleur est son rapport — sur la période observée. "
-            "Les points élevés proviennent presque toujours de méthodes qui "
-            "estiment des rendements attendus."
+            "Le risque s'étend vers la gauche, le rendement vers la droite. "
+            "Une barre longue d'un côté sans contrepartie de l'autre signale "
+            "un mauvais échange."
+        )
+
+        deux_cotes = pd.DataFrame({
+            "Risque (volatilité)": -tableau_opt["Volatilité (%)"],
+            "Rendement annualisé": tableau_opt["Perf. annualisée (%)"],
+        }).sort_values("Rendement annualisé")
+        st.bar_chart(deux_cotes, height=320, horizontal=True)
+        st.caption(
+            "Le risque est porté en négatif pour qu'il s'affiche à gauche : "
+            "il s'agit bien d'une volatilité positive."
+        )
+
+        pertes_cotes = pd.DataFrame({
+            "Perte maximale": tableau_opt["Perte max (%)"],
+            "Rendement annualisé": tableau_opt["Perf. annualisée (%)"],
+        }).sort_values("Rendement annualisé")
+        st.bar_chart(pertes_cotes, height=320, horizontal=True)
+        st.caption(
+            "Même lecture avec la perte maximale, déjà négative. C'est le "
+            "chiffre qui détermine si une allocation se tient jusqu'au bout, "
+            "davantage que la volatilité."
         )
 
         st.markdown("**Détail d'une répartition**")
