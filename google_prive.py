@@ -74,6 +74,18 @@ def lire(st, url: str, onglet: str | int | None = None) -> pd.DataFrame:
     if not cle:
         raise ValueError("Adresse de classeur non reconnue.")
 
+    # Une adresse de publication porte un identifiant de PUBLICATION, distinct
+    # de celui du classeur. Le compte de service ne peut pas l'ouvrir, et
+    # l'erreur renvoyée par Google ne le dit pas clairement.
+    if cle.startswith("2PACX") or "/d/e/" in url:
+        raise ValueError(
+            "Cette adresse est celle d'une feuille PUBLIÉE, pas du classeur.\n\n"
+            "Ouvre ta feuille dans Google Sheets et copie l'adresse de la "
+            "barre du navigateur, celle de la forme :\n"
+            "`https://docs.google.com/spreadsheets/d/IDENTIFIANT/edit#gid=0`\n\n"
+            "L'identifiant y fait une quarantaine de caractères et ne commence "
+            "pas par « 2PACX ».")
+
     try:
         classeur = _client(st).open_by_key(cle)
     except Exception as erreur:

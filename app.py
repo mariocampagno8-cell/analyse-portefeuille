@@ -313,14 +313,17 @@ def lire_feuille(url: str) -> pd.DataFrame:
     lecture publique ne sert que de repli, pour les feuilles encore publiées.
     """
     if gpv.disponible(st):
+        # Le compte de service est configuré : une erreur ici doit remonter
+        # telle quelle. Retomber silencieusement sur la lecture publique
+        # masquerait la vraie cause et afficherait un message hors sujet.
         try:
             return fe.nettoyer(gpv.lire(st, url))
-        except PermissionError as erreur:
-            raise ValueError(
-                f"{erreur}\n\nPartage la feuille avec l'adresse du compte de "
-                "service, en lecture.") from erreur
+        except (PermissionError, ValueError) as erreur:
+            raise ValueError(str(erreur)) from erreur
         except Exception as erreur:
-            print(f"Lecture authentifiée impossible : {erreur}", file=sys.stderr)
+            raise ValueError(
+                f"Lecture authentifiée impossible : {type(erreur).__name__} — "
+                f"{str(erreur)[:200]}") from erreur
     return fe.lire(url)
 
 
