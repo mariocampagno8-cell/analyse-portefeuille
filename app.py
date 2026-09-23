@@ -91,7 +91,7 @@ def devise_du_ticker(ticker: str) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def taux_de_change(source: str, cible: str) -> float:
     """Taux de conversion 1 unite de `source` vers `cible`."""
-    if source == cible:
+    if True:
         return 1.0
     try:
         d = yf.download(f"{source}{cible}=X", period="5d",
@@ -182,25 +182,27 @@ else:
         "Feuilles lues en accès public : leur adresse suffit à les consulter. "
         "Configure un compte de service pour y remédier.", icon="⚠️")
 
-st.sidebar.subheader("Source du portefeuille")
-source = st.sidebar.radio(
-    "Où sont tes positions ?", ["Saisie dans l'app", "Google Sheets"],
-    label_visibility="collapsed",
-    help="Google Sheets te permet de modifier ton portefeuille depuis ton "
-         "téléphone. L'app le relit à chaque rechargement.",
-)
-
+# La feuille Google est l'unique source du portefeuille : une seule origine
+# évite qu'une saisie locale et une feuille divergent sans qu'on sache
+# laquelle fait foi.
+st.sidebar.subheader("Portefeuille")
 url_feuille = ""
-if source == "Google Sheets":
+try:
+    url_feuille = str(st.secrets.get("url_feuille", "")).strip()
+except Exception:
+    pass
+
+if url_feuille:
+    st.sidebar.caption("Alimenté depuis ta feuille Google.")
+else:
     url_feuille = st.sidebar.text_input(
         "Adresse de la feuille",
-        value=st.secrets.get("url_feuille", "") if hasattr(st, "secrets") else "",
-        help="Colle l'adresse de ta feuille Google. Elle doit être publiée "
-             "sur le web (Fichier → Partager → Publier sur le web).",
-    )
-    if st.sidebar.button("Recharger la feuille", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+        help="Renseigne `url_feuille` dans les secrets Streamlit pour ne plus "
+             "avoir à la saisir.")
+
+if st.sidebar.button("Recharger la feuille", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
 
 st.sidebar.divider()
 st.sidebar.caption(
@@ -293,75 +295,41 @@ def lire_feuille(url: str) -> pd.DataFrame:
 
 def _onglet_0():
     global val, poids, rdt, rdt_bench, freq, rdt_ptf, cov, total, cours, reg, edite
-    if source == "Google Sheets":
-        if not url_feuille:
-            st.info(
-                "Colle l'adresse de ta feuille Google dans la barre latérale. "
-                "Elle doit contenir trois colonnes en première ligne : "
-                "**Ticker**, **Quantité** et **Prix d'achat**."
-            )
-            st.markdown("**Modèle de feuille**")
-            st.dataframe(fe.MODELE, use_container_width=True, hide_index=True)
-            st.download_button(
-                "Télécharger le modèle (CSV)",
-                fe.MODELE.to_csv(index=False).encode("utf-8"),
-                "modele_portefeuille.csv", "text/csv",
-            )
-            return
-
-        try:
-            with st.spinner("Lecture de la feuille…"):
-                depuis_feuille = lire_feuille(url_feuille)
-        except ValueError as erreur:
-            st.error(str(erreur))
-            return
-
-        st.success(f"{len(depuis_feuille)} ligne(s) lue(s) depuis Google Sheets.")
-        for alerte in fe.diagnostic(depuis_feuille):
-            st.warning(alerte)
-
-        st.caption(
-            "Lecture seule. Pour modifier ton portefeuille, ouvre la feuille "
-            "dans Google Sheets — depuis ton téléphone si tu veux — puis clique "
-            "sur « Recharger la feuille » dans la barre latérale."
+    if not url_feuille:
+        st.info(
+            "Colle l'adresse de ta feuille Google dans la barre latérale. "
+            "Elle doit contenir trois colonnes en première ligne : "
+            "**Ticker**, **Quantité** et **Prix d'achat**."
         )
-        st.dataframe(depuis_feuille, use_container_width=True, hide_index=True)
-        st.link_button("Ouvrir la feuille", url_feuille)
-        edite = depuis_feuille
-        st.session_state.portefeuille = edite
+        st.markdown("**Modèle de feuille**")
+        st.dataframe(fe.MODELE, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Télécharger le modèle (CSV)",
+            fe.MODELE.to_csv(index=False).encode("utf-8"),
+            "modele_portefeuille.csv", "text/csv",
+        )
+        return
 
-    else:
-        st.caption(
-            "Modifie directement le tableau. Le bouton du bas ajoute une ligne, "
-            "la corbeille en supprime une."
-        )
-        edite = st.data_editor(
-            st.session_state.portefeuille,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", required=True),
-                "Quantité": st.column_config.NumberColumn(
-                    "Quantité", min_value=0.0, step=1.0, format="%.4f"),
-                "Prix d'achat": st.column_config.NumberColumn(
-                    "Prix d'achat unitaire", min_value=0.0, step=0.01,
-                    format="%.2f",
-                    help="Dans la devise de cotation de la valeur.",
-                ),
-            },
-            key="editeur",
-        )
-        st.session_state.portefeuille = edite
+    try:
+        with st.spinner("Lecture de la feuille…"):
+            depuis_feuille = lire_feuille(url_feuille)
+    except ValueError as erreur:
+        st.error(str(erreur))
+        return
 
-        col_a, col_b = st.columns([1, 5])
-        if col_a.button("Enregistrer", use_container_width=True):
-            enregistrer_portefeuille(edite)
-            st.success(f"Portefeuille écrit dans {FICHIER_PORTEFEUILLE.name}")
-        col_b.caption(
-            "Sur l'hébergement en ligne, cet enregistrement est temporaire et "
-            "sera effacé au prochain redéploiement. Passe par Google Sheets "
-            "dans la barre latérale pour une sauvegarde durable."
-        )
+    st.success(f"{len(depuis_feuille)} ligne(s) lue(s) depuis Google Sheets.")
+    for alerte in fe.diagnostic(depuis_feuille):
+        st.warning(alerte)
+
+    st.caption(
+        "Lecture seule. Pour modifier ton portefeuille, ouvre la feuille "
+        "dans Google Sheets — depuis ton téléphone si tu veux — puis clique "
+        "sur « Recharger la feuille » dans la barre latérale."
+    )
+    st.dataframe(depuis_feuille, use_container_width=True, hide_index=True)
+    st.link_button("Ouvrir la feuille", url_feuille)
+    edite = depuis_feuille
+    st.session_state.portefeuille = edite
 
     lignes = edite.dropna(subset=["Ticker"]).copy()
     lignes["Ticker"] = lignes["Ticker"].str.strip().str.upper()
