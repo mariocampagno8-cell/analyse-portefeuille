@@ -39,6 +39,43 @@ def disponible(st) -> bool:
         return False
 
 
+DEBUT_PEM = "-----BEGIN PRIVATE KEY-----"
+FIN_PEM = "-----END PRIVATE KEY-----"
+
+
+def reparer_cle(brut: str) -> str:
+    """
+    Reconstitue une cle PEM valide, quelle que soit sa forme d'origine.
+
+    Le format PEM exige des retours a la ligne reels autour des marqueurs et
+    un corps decoupe en lignes de 64 caracteres. Or une cle recopiee a la main
+    dans un fichier de secrets arrive sous des formes variees : `\n` restes
+    litteraux, marqueurs colles au corps, espaces inseres par un copier-coller,
+    guillemets residuels. Plutot que d'exiger un format parfait, on extrait le
+    corps et on le remet en forme.
+    """
+    if not brut:
+        return ""
+
+    texte = str(brut).strip().strip('"').strip("'")
+    # Les retours à la ligne échappés deviennent de vrais retours
+    texte = texte.replace("\\n", "\n").replace("\r\n", "\n")
+
+    if DEBUT_PEM not in texte:
+        # Corps seul, sans marqueurs : on les rétablit
+        corps = "".join(texte.split())
+    else:
+        apres_debut = texte.split(DEBUT_PEM, 1)[1]
+        corps = apres_debut.split(FIN_PEM, 1)[0]
+        corps = "".join(corps.split())
+
+    if not corps:
+        return texte
+
+    lignes = [corps[i:i + 64] for i in range(0, len(corps), 64)]
+    return DEBUT_PEM + "\n" + "\n".join(lignes) + "\n" + FIN_PEM + "\n"
+
+
 def _client(st):
     """
     Client Google Sheets authentifie.
@@ -52,8 +89,9 @@ def _client(st):
 
     portee = ["https://www.googleapis.com/auth/spreadsheets.readonly",
               "https://www.googleapis.com/auth/drive.readonly"]
-    identifiants = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]), scopes=portee)
+    infos = dict(st.secrets["gcp_service_account"])
+    infos["private_key"] = reparer_cle(infos.get("private_key", ""))
+    identifiants = Credentials.from_service_account_info(infos, scopes=portee)
     return gspread.authorize(identifiants)
 
 
