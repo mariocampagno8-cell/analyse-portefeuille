@@ -22,6 +22,7 @@ import acces as ac
 import analyse as ia
 import analytics as an
 import feuille as fe
+import google_prive as gpv
 import fondamentaux as fo
 import indicateurs as ind
 import optimisation as opt
@@ -174,6 +175,13 @@ seuil_var = st.sidebar.select_slider(
 ia.reglages_barre_laterale()
 
 st.sidebar.divider()
+if gpv.disponible(st):
+    st.sidebar.success("Feuilles lues par compte de service", icon="🔒")
+else:
+    st.sidebar.warning(
+        "Feuilles lues en accès public : leur adresse suffit à les consulter. "
+        "Configure un compte de service pour y remédier.", icon="⚠️")
+
 st.sidebar.subheader("Source du portefeuille")
 source = st.sidebar.radio(
     "Où sont tes positions ?", ["Saisie dans l'app", "Google Sheets"],
@@ -257,6 +265,18 @@ onglets = st.tabs([
     "Portefeuille", "Valeur", "Surveillance", "Risque", "Simulateur",
     "Stratégies options",
 ])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def lire_feuille_privee(url: str, onglet=None) -> pd.DataFrame:
+    """
+    Lecture par compte de service, avec repli sur la feuille publiée.
+
+    Le repli est signalé à l'utilisateur plutôt que silencieux : continuer à
+    lire une feuille publique sans le savoir est précisément le problème que
+    le compte de service résout.
+    """
+    return gpv.lire(st, url, onglet)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
