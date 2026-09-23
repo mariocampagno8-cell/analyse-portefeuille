@@ -8,6 +8,7 @@ Le portefeuille est sauvegarde dans portefeuille.json a cote du script.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -284,12 +285,42 @@ def lire_feuille_privee(url: str, onglet=None) -> pd.DataFrame:
 @st.cache_data(ttl=300, show_spinner=False)
 def lire_liste_surveillance(url: str) -> list[str]:
     """Liste de surveillance depuis Google Sheets. Cache 5 min."""
+    if gpv.disponible(st):
+        try:
+            brut = gpv.lire(st, url)
+            colonne = brut.columns[0]
+            for candidate in brut.columns:
+                if str(candidate).strip().lower() in ("ticker", "symbole",
+                                                      "valeur", "code"):
+                    colonne = candidate
+                    break
+            tickers = [str(t).strip().upper() for t in brut[colonne].dropna()
+                       if str(t).strip()]
+            if tickers:
+                return list(dict.fromkeys(tickers))
+        except Exception as erreur:
+            print(f"Surveillance authentifiée impossible : {erreur}",
+                  file=sys.stderr)
     return fe.lire_liste(url)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def lire_feuille(url: str) -> pd.DataFrame:
-    """Portefeuille depuis Google Sheets. Cache 5 min."""
+    """
+    Portefeuille depuis Google Sheets. Cache 5 min.
+
+    Le compte de service est privilégié : il lit une feuille privée. La
+    lecture publique ne sert que de repli, pour les feuilles encore publiées.
+    """
+    if gpv.disponible(st):
+        try:
+            return fe.nettoyer(gpv.lire(st, url))
+        except PermissionError as erreur:
+            raise ValueError(
+                f"{erreur}\n\nPartage la feuille avec l'adresse du compte de "
+                "service, en lecture.") from erreur
+        except Exception as erreur:
+            print(f"Lecture authentifiée impossible : {erreur}", file=sys.stderr)
     return fe.lire(url)
 
 

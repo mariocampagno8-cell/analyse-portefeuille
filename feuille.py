@@ -180,7 +180,18 @@ def lire(url: str) -> pd.DataFrame:
             f"Tentatives : {' | '.join(echecs)}"
         )
 
-    if df.empty:
+    return nettoyer(df)
+
+
+def nettoyer(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Valide et met en forme un tableau deja telecharge.
+
+    Separee de `lire` pour que la lecture authentifiee par compte de service
+    beneficie exactement des memes controles : un seul endroit decide de ce
+    qu'est un portefeuille valide.
+    """
+    if df is None or df.empty:
         raise ValueError("La feuille est vide.")
 
     df = _normaliser_colonnes(df)
