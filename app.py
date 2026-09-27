@@ -45,6 +45,18 @@ PLAFOND_MOUVEMENT = 12.0
 PROXIMITE_SEUIL = 3.0            # % — approche d'un seuil
 CONCENTRATION = 25.0             # % — poids maximal d'une ligne
 
+# Seuils de vente et d'achat calculés par l'application quand la feuille ne
+# les renseigne pas. Le stop est suiveur : il s'accroche au plus haut récent
+# et s'en écarte d'un multiple de la volatilité du titre sur un mois de
+# bourse, de sorte qu'une valeur calme se déclenche tôt et une valeur agitée
+# ne se déclenche pas sur son bruit ordinaire.
+HORIZON_STOP = 20                # séances — un mois de bourse
+STOP_SIGMA = 2.0                 # écarts-types
+STOP_MIN = 8.0                   # % — plancher
+STOP_MAX = 30.0                  # % — plafond
+FENETRE_HAUT = 120               # séances — plus haut de référence
+FENETRE_MOYENNE = 50             # séances — moyenne de référence pour l'achat
+
 
 st.set_page_config(page_title="FinexResearch", page_icon="◪", layout="wide")
 ac.porte("FinexResearch")
@@ -213,6 +225,56 @@ def seuil_titre(prix: pd.Series) -> float:
                                PLANCHER_MOUVEMENT, PLAFOND_MOUVEMENT)))
 
 
+def _fini(x) -> bool:
+    """Un nombre exploitable, strictement positif."""
+    try:
+        return bool(np.isfinite(float(x))) and float(x) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def seuils_auto(prix: pd.Series) -> tuple[float, float, float]:
+    """
+    Stop de vente et prix de repli déduits du titre lui-même.
+
+    Le stop est un stop suiveur : plus haut des six derniers mois diminué
+    d'une marge égale à STOP_SIGMA écarts-types du rendement sur HORIZON_STOP
+    séances. Le prix de repli est la moyenne de moyen terme diminuée de la
+    moitié de cette marge — un simple niveau de patience, pas une prévision.
+
+    Retourne (entrée, sortie, marge en %). NaN si l'historique est trop court.
+    """
+    p = prix.dropna()
+    if len(p) < 60:
+        return (np.nan, np.nan, np.nan)
+    r = p.pct_change().dropna().tail(250)
+    if len(r) < 40 or float(r.std(ddof=1)) <= 0:
+        return (np.nan, np.nan, np.nan)
+    ecart = float(r.std(ddof=1)) * np.sqrt(HORIZON_STOP) * 100
+    marge = float(np.clip(ecart * STOP_SIGMA, STOP_MIN, STOP_MAX))
+    sortie = float(p.tail(FENETRE_HAUT).max()) * (1 - marge / 100)
+    entree = float(p.tail(FENETRE_MOYENNE).mean()) * (1 - marge / 200)
+    return (entree, sortie, marge)
+
+
+def seuils_retenus(ligne: pd.Series, prix: pd.Series) -> dict:
+    """
+    Concilie ce que dit la feuille et ce que calcule l'application.
+
+    Une valeur saisie à la main l'emporte toujours : c'est une décision, pas
+    une estimation. Sinon le calcul prend le relais, et l'origine est
+    conservée pour être affichée honnêtement.
+    """
+    e_auto, s_auto, marge = seuils_auto(prix)
+    manuel_e, manuel_s = _fini(ligne.get("Prix entrée")), _fini(ligne.get("Prix sortie"))
+    return {
+        "entree": float(ligne["Prix entrée"]) if manuel_e else e_auto,
+        "sortie": float(ligne["Prix sortie"]) if manuel_s else s_auto,
+        "entree_manuelle": manuel_e,
+        "sortie_manuelle": manuel_s,
+        "marge": marge}
+
+
 def faits(univers: pd.DataFrame, cours: pd.DataFrame,
           depuis: datetime | None, poids: pd.Series) -> list[dict]:
     """
@@ -241,18 +303,31 @@ def faits(univers: pd.DataFrame, cours: pd.DataFrame,
         actuel = float(prix.iloc[-1])
         reference = float(prix.iloc[-seances - 1])
         variation = (actuel / reference - 1) * 100
-        entree, sortie = ligne["Prix entrée"], ligne["Prix sortie"]
+        s = seuils_retenus(ligne, prix)
+        entree, sortie = s["entree"], s["sortie"]
+        source_s = "" if s["sortie_manuelle"] else " (stop suiveur calculé)"
+        source_e = "" if s["entree_manuelle"] else " (niveau calculé)"
 
-        if np.isfinite(sortie) and actuel <= sortie < reference:
+        if _fini(sortie) and actuel <= sortie < reference:
             evenements.append({
                 "rang": 0, "emoji": "🔴", "ticker": t,
                 "titre": "Seuil de vente franchi",
-                "detail": f"{actuel:.2f} contre un seuil à {sortie:.2f}"})
-        elif np.isfinite(entree) and actuel <= entree < reference:
+                "detail": f"{actuel:.2f} contre un seuil à "
+                          f"{sortie:.2f}{source_s}"})
+        elif _fini(entree) and actuel <= entree < reference:
             evenements.append({
                 "rang": 0, "emoji": "🎯", "ticker": t,
                 "titre": "Prix d'entrée atteint",
-                "detail": f"{actuel:.2f} contre un objectif à {entree:.2f}"})
+                "detail": f"{actuel:.2f} contre un objectif à "
+                          f"{entree:.2f}{source_e}"})
+        elif _fini(sortie) and actuel <= sortie:
+            # Franchissement plus ancien que la dernière visite : le dire quand
+            # même, sinon la ligne reste sous son seuil dans un silence total.
+            evenements.append({
+                "rang": 1, "emoji": "🔴", "ticker": t,
+                "titre": "Toujours sous le seuil de vente",
+                "detail": f"{actuel:.2f}, soit {abs(actuel / sortie - 1) * 100:.1f} % "
+                          f"sous le seuil de {sortie:.2f}{source_s}"})
         else:
             limite = seuil_titre(prix)
             if abs(variation) >= limite:
@@ -261,12 +336,20 @@ def faits(univers: pd.DataFrame, cours: pd.DataFrame,
                     "titre": f"Mouvement de {variation:+.1f} %",
                     "detail": f"{actuel:.2f} — au-delà du seuil de ±{limite:.1f} % "
                               f"propre à ce titre"})
-            elif np.isfinite(entree) and 0 < (actuel / entree - 1) * 100 <= PROXIMITE_SEUIL:
+            elif _fini(sortie) and 0 < (actuel / sortie - 1) * 100 <= PROXIMITE_SEUIL:
+                evenements.append({
+                    "rang": 2, "emoji": "🟠", "ticker": t,
+                    "titre": "Approche du seuil de vente",
+                    "detail": f"{actuel:.2f}, à "
+                              f"{(actuel / sortie - 1) * 100:+.1f} % du seuil "
+                              f"de {sortie:.2f}{source_s}"})
+            elif _fini(entree) and 0 < (actuel / entree - 1) * 100 <= PROXIMITE_SEUIL:
                 evenements.append({
                     "rang": 2, "emoji": "📉", "ticker": t,
                     "titre": "Approche du prix d'entrée",
-                    "detail": f"{actuel:.2f}, soit "
-                              f"{(actuel / entree - 1) * 100:+.1f} % de l'objectif"})
+                    "detail": f"{actuel:.2f}, à "
+                              f"{(actuel / entree - 1) * 100:+.1f} % de "
+                              f"l'objectif de {entree:.2f}{source_e}"})
 
     if not poids.empty:
         lourde = poids.idxmax()
@@ -350,6 +433,7 @@ for _, ligne in univers.iterrows():
     veille = float(serie.iloc[-2]) if len(serie) > 1 else cours_actuel
     change = taux(monnaies.get(t, devise_base), devise_base)
     quantite = ligne["Quantité"] if np.isfinite(ligne["Quantité"]) else 0.0
+    bornes = seuils_retenus(ligne, serie)
 
     lignes.append({
         "Ticker": t,
@@ -360,8 +444,10 @@ for _, ligne in univers.iterrows():
         "PRU": ligne["PRU"],
         "Gain (%)": ((cours_actuel / ligne["PRU"] - 1) * 100
                      if np.isfinite(ligne["PRU"]) and ligne["PRU"] > 0 else np.nan),
-        "Prix entrée": ligne["Prix entrée"],
-        "Prix sortie": ligne["Prix sortie"]})
+        "Stop": bornes["sortie"],
+        "Marge (%)": ((bornes["sortie"] / cours_actuel - 1) * 100
+                      if _fini(bornes["sortie"]) else np.nan),
+        "Manuel": bool(bornes["sortie_manuelle"])})
 
 table = pd.DataFrame(lignes).set_index("Ticker")
 detenues = table[table["Quantité"] > 0]
@@ -404,7 +490,7 @@ if len(rdt) > 60:
                 f"{an.volatilite(an.rendements_portefeuille(rdt, poids.reindex(rdt.columns).fillna(0))) * 100:.1f} %")
 
 colonnes = ["Quantité", "Cours", "Jour (%)", "Valeur", "Gain (%)",
-            "Poids (%)", "Risque (%)"]
+            "Poids (%)", "Risque (%)", "Stop", "Marge (%)", "Manuel"]
 st.dataframe(
     detenues[[c for c in colonnes if c in detenues.columns]]
     .sort_values("Valeur", ascending=False).round(2),
@@ -416,6 +502,17 @@ st.dataframe(
         "Poids (%)": st.column_config.ProgressColumn(
             format="%.1f %%", min_value=0,
             max_value=float(table["Poids (%)"].max() or 100)),
+        "Stop": st.column_config.NumberColumn(
+            format="%.2f",
+            help="Seuil de vente. Calculé par l'application, sauf si la "
+                 "colonne « Prix sortie » de ta feuille impose une valeur."),
+        "Marge (%)": st.column_config.NumberColumn(
+            format="%+.1f %%",
+            help="Baisse que le cours peut encore encaisser avant de toucher "
+                 "le stop. Une valeur positive signifie que la ligne est "
+                 "déjà passée sous son seuil."),
+        "Manuel": st.column_config.CheckboxColumn(
+            help="Coché : le stop vient de ta feuille. Décoché : il est calculé."),
     })
 
 
@@ -472,6 +569,9 @@ marquer_visite()
 st.divider()
 st.caption(
     f"Cours au {cours.index[-1].strftime('%d/%m/%Y')}, source Yahoo Finance. "
-    "Les seuils proviennent des colonnes « Prix entrée » et « Prix sortie » "
-    "de ta feuille : sans eux, le bloc du milieu reste vide."
+    f"Les seuils sont calculés par l'application : stop suiveur à "
+    f"{STOP_SIGMA:.0f} écarts-types du plus haut des "
+    f"{FENETRE_HAUT} dernières séances, entre {STOP_MIN:.0f} et "
+    f"{STOP_MAX:.0f} %. Une valeur saisie dans les colonnes « Prix entrée » "
+    "ou « Prix sortie » de ta feuille remplace le calcul pour cette ligne."
 )
