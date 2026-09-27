@@ -34,6 +34,9 @@ import acces as ac
 import analytics as an
 import feuille as fe
 import google_prive as gpv
+import mouvements as mo
+
+ONGLET_MOUVEMENTS = "MOUVEMENTS"
 
 ETAT = Path(__file__).parent / "derniere_visite.json"
 
@@ -138,8 +141,63 @@ def charger_univers(url: str) -> pd.DataFrame:
             "Quantité": fe._nombre(ligne.get("Quantité")),
             "PRU": fe._nombre(ligne.get("PRU")),
             "Prix entrée": fe._nombre(ligne.get("Prix entrée")),
-            "Prix sortie": fe._nombre(ligne.get("Prix sortie"))})
+            "Prix sortie": fe._nombre(ligne.get("Prix sortie")),
+            "Devise saisie": (str(ligne.get("Devise", "") or "").strip().upper()
+                              or None)})
     return pd.DataFrame(lignes).drop_duplicates(subset="Ticker")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def charger_mouvements(url: str) -> pd.DataFrame:
+    """
+    Journal des achats et des ventes, s'il existe.
+
+    Son absence n'est pas une erreur : la feuille peut ne contenir que des
+    positions. Elle est signalee dans l'interface, pas ici.
+    """
+    if not gpv.disponible(st):
+        return pd.DataFrame(columns=mo.COLONNES)
+    try:
+        brut = gpv.lire(st, url, onglet=ONGLET_MOUVEMENTS)
+    except Exception:
+        return pd.DataFrame(columns=mo.COLONNES)
+    return mo.lire(brut)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def historique_change(devise: str, cible: str) -> pd.Series:
+    """Serie du taux de change, pour valoriser une vente au cours de son jour."""
+    if devise == cible:
+        return pd.Series(dtype=float)
+    try:
+        donnees = yf.download(f"{devise}{cible}=X", period="10y",
+                              interval="1d", progress=False, auto_adjust=True)
+        if isinstance(donnees.columns, pd.MultiIndex):
+            donnees.columns = donnees.columns.get_level_values(0)
+        serie = donnees["Close"].dropna()
+        serie.index = pd.to_datetime(serie.index).tz_localize(None)
+        return serie
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def change_date(devise: str | None, date, cible: str) -> float:
+    """
+    Taux de change a une date donnee, ou le plus proche anterieur.
+
+    A defaut d'historique, le taux du jour sert de pis-aller. C'est une
+    approximation qu'il faut connaitre : sur une vente ancienne en dollar,
+    elle peut deplacer la plus-value de plusieurs pour cent.
+    """
+    if not devise or devise == cible:
+        return 1.0
+    serie = historique_change(devise, cible)
+    if serie.empty:
+        return taux(devise, cible)
+    jour = pd.Timestamp(date).tz_localize(None) if pd.Timestamp(date).tz \
+        else pd.Timestamp(date)
+    anterieurs = serie[serie.index <= jour]
+    return float(anterieurs.iloc[-1]) if not anterieurs.empty else float(serie.iloc[0])
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -413,6 +471,31 @@ if univers.empty:
     st.warning("Aucune ligne exploitable dans la feuille.")
     st.stop()
 
+# --- Journal des mouvements
+# Quand il existe, il fait foi : une quantite deduite d'operations datees est
+# plus fiable qu'une quantite ressaisie a la main. Les divergences ne sont pas
+# arbitrees en silence, elles sont affichees.
+mvts = charger_mouvements(url)
+etat_journal, anomalies_journal = mo.derouler(mvts)
+divergences = []
+
+if not etat_journal.empty:
+    univers = univers.set_index("Ticker")
+    for t, e in etat_journal.iterrows():
+        if t in univers.index:
+            ancienne_q = univers.at[t, "Quantité"]
+            if np.isfinite(ancienne_q) and abs(ancienne_q - e["Quantité"]) > 1e-6:
+                divergences.append(
+                    f"{t} : {ancienne_q:g} titres dans l'onglet PORTEFEUILLE, "
+                    f"{e['Quantité']:g} d'après le journal.")
+        else:
+            univers.loc[t] = {c: np.nan for c in univers.columns}
+        univers.at[t, "Quantité"] = e["Quantité"]
+        univers.at[t, "PRU"] = e["PRU"]
+        if e["Devise"]:
+            univers.at[t, "Devise saisie"] = e["Devise"]
+    univers = univers.reset_index()
+
 tickers = tuple(univers["Ticker"])
 with st.spinner("Chargement des cours…"):
     cours = charger_cours(tickers)
@@ -431,12 +514,17 @@ for _, ligne in univers.iterrows():
     serie = cours[t].dropna()
     cours_actuel = float(serie.iloc[-1])
     veille = float(serie.iloc[-2]) if len(serie) > 1 else cours_actuel
-    change = taux(monnaies.get(t, devise_base), devise_base)
+    # La devise saisie l'emporte sur celle que devine Yahoo, qui se trompe
+    # regulierement sur les petites capitalisations europeennes.
+    devise_ligne = (ligne.get("Devise saisie")
+                    or monnaies.get(t, devise_base))
+    change = taux(devise_ligne, devise_base)
     quantite = ligne["Quantité"] if np.isfinite(ligne["Quantité"]) else 0.0
     bornes = seuils_retenus(ligne, serie)
 
     lignes.append({
         "Ticker": t,
+        "Devise": devise_ligne,
         "Quantité": quantite,
         "Cours": cours_actuel,
         "Jour (%)": (cours_actuel / veille - 1) * 100,
@@ -474,8 +562,17 @@ table["Risque (%)"] = part_risque.reindex(table.index)
 variation_jour = float((detenues["Valeur"] * detenues["Jour (%)"]).sum()
                        / total) if total > 0 else 0.0
 investi = float((detenues["PRU"] * detenues["Quantité"]
-                 * [taux(monnaies.get(t, devise_base), devise_base)
+                 * [taux(table.at[t, "Devise"], devise_base)
                     for t in detenues.index]).sum())
+
+# Plus-values realisees, au taux de change du jour de chaque vente.
+pv_realisee = 0.0
+pv_par_ligne = pd.Series(dtype=float)
+if not mvts.empty:
+    pv_par_ligne = mo.pv_convertie(
+        mvts, etat_journal,
+        lambda d, j: change_date(d, j, devise_base))
+    pv_realisee = float(pv_par_ligne.sum())
 
 m = st.columns(4)
 m[0].metric("Valeur", f"{total:,.0f} {devise_base}".replace(",", " "),
@@ -484,12 +581,39 @@ m[1].metric("Plus-value latente",
             f"{total - investi:+,.0f} {devise_base}".replace(",", " ")
             if investi > 0 else "—",
             f"{(total / investi - 1) * 100:+.1f} %" if investi > 0 else None)
-m[2].metric("Lignes", f"{len(detenues)}")
+if not mvts.empty:
+    m[2].metric("Plus-values réalisées",
+                f"{pv_realisee:+,.0f} {devise_base}".replace(",", " "),
+                help="Résultat définitif des ventes, au taux de change du "
+                     "jour de chaque cession. Avant impôt.")
+else:
+    m[2].metric("Lignes", f"{len(detenues)}")
 if len(rdt) > 60:
     m[3].metric("Volatilité",
                 f"{an.volatilite(an.rendements_portefeuille(rdt, poids.reindex(rdt.columns).fillna(0))) * 100:.1f} %")
 
-colonnes = ["Quantité", "Cours", "Jour (%)", "Valeur", "Gain (%)",
+doublons_journal = mo.doublons(mvts)
+rejets = mvts.attrs.get("rejets", [])
+a_verifier = (len(divergences) + len(anomalies_journal)
+              + len(doublons_journal) + len(rejets))
+
+if a_verifier:
+    with st.expander(f"⚠️ {a_verifier} point(s) à vérifier dans ta feuille"):
+        for d in divergences:
+            st.markdown(f"- **Divergence** — {d} Le journal a été retenu.")
+        for a in anomalies_journal:
+            st.markdown(f"- **Journal** — {a}")
+        for d in doublons_journal:
+            st.markdown(f"- **Doublon possible** — {d} À conserver si les deux "
+                        f"ordres sont réels, à supprimer si c'est un "
+                        f"copier-coller.")
+        if rejets:
+            st.markdown(
+                f"- **Lignes ignorées** — lignes {', '.join(map(str, rejets))} "
+                f"de l'onglet {ONGLET_MOUVEMENTS} : date, sens, quantité ou "
+                f"prix illisible. Elles n'entrent dans aucun calcul.")
+
+colonnes = ["Devise", "Quantité", "Cours", "Jour (%)", "Valeur", "Gain (%)",
             "Poids (%)", "Risque (%)", "Stop", "Marge (%)", "Manuel"]
 st.dataframe(
     detenues[[c for c in colonnes if c in detenues.columns]]
@@ -514,6 +638,66 @@ st.dataframe(
         "Manuel": st.column_config.CheckboxColumn(
             help="Coché : le stop vient de ta feuille. Décoché : il est calculé."),
     })
+
+# --- Positions soldées
+soldees = mo.cloturees(etat_journal)
+if not soldees.empty:
+    recap = soldees[["Devise", "PV réalisée", "Frais cumulés",
+                     "Dernier mouvement"]].copy()
+    recap[f"PV en {devise_base}"] = pv_par_ligne.reindex(recap.index)
+    recap["Dernier mouvement"] = pd.to_datetime(
+        recap["Dernier mouvement"]).dt.strftime("%d/%m/%Y")
+    gagnantes = int((recap[f"PV en {devise_base}"] > 0).sum())
+    with st.expander(f"Positions soldées — {len(recap)} ligne(s), "
+                     f"{gagnantes} gagnante(s)"):
+        st.dataframe(recap.round(2), use_container_width=True,
+                     column_config={
+                         f"PV en {devise_base}":
+                             st.column_config.NumberColumn(format="%+.0f"),
+                         "PV réalisée": st.column_config.NumberColumn(
+                             format="%+.2f",
+                             help="Dans la devise de cotation."),
+                     })
+        st.caption(
+            "Plus-values brutes, avant prélèvement forfaitaire unique. "
+            "Une ligne soldée puis rachetée réapparaît dans le tableau du "
+            "dessus, sa plus-value passée restant acquise ici.")
+
+# --- Piste d'audit
+if not mvts.empty:
+    with st.expander("Vérifier le détail d'une ligne"):
+        choix = st.selectbox(
+            "Valeur", sorted(mvts["Ticker"].unique()), key="audit_ticker",
+            help="Chaque opération avec le prix de revient qui lui a été "
+                 "appliqué et le résultat qu'elle a dégagé.")
+        detail = mo.piste(mvts, choix)
+        if detail.empty:
+            st.caption("Aucune opération.")
+        else:
+            affichage = detail.copy()
+            affichage["Date"] = pd.to_datetime(
+                affichage["Date"]).dt.strftime("%d/%m/%Y")
+            st.dataframe(
+                affichage.round(4), use_container_width=True, hide_index=True,
+                column_config={
+                    "Résultat": st.column_config.NumberColumn(
+                        format="%+.2f",
+                        help="Plus ou moins-value dégagée par cette vente, "
+                             "frais déduits, dans la devise de cotation."),
+                    "PRU appliqué": st.column_config.NumberColumn(
+                        format="%.4f",
+                        help="Prix de revient au moment de la vente. Il ne "
+                             "change pas entre deux tranches vendues sans "
+                             "achat intermédiaire."),
+                })
+            somme = detail["Résultat"].sum(skipna=True)
+            ventes = int(detail["Résultat"].notna().sum())
+            st.caption(
+                f"{ventes} vente(s), résultat cumulé "
+                f"{somme:+,.2f} en devise de cotation. ".replace(",", " ")
+                + "Plusieurs opérations le même jour sont traitées dans "
+                  "l'ordre des lignes de ta feuille : place l'achat avant la "
+                  "vente si les deux ont eu lieu le même jour.")
 
 
 # ==========================================================================
