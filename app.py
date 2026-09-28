@@ -34,6 +34,7 @@ import acces as ac
 import analytics as an
 import feuille as fe
 import google_prive as gpv
+import analyse as ia
 import mouvements as mo
 import niveaux as nvx
 
@@ -669,60 +670,144 @@ st.subheader("Stops et objectifs")
 onglets_niveaux = st.tabs(["Vue d'ensemble", "Détail d'une ligne"])
 
 with onglets_niveaux[0]:
-    horizon = st.radio("Horizon", list(nvx.HORIZONS.keys()), index=1,
-                       horizontal=True, key="horizon_ensemble",
-                       help="Court : quelques semaines. Moyen : quelques mois. "
-                            "Long : un an et plus. Seule la fenêtre "
-                            "d'observation change, la méthode est la même.")
+    barre = st.columns([4, 1])
+    with barre[0]:
+        horizon = st.radio(
+            "Horizon", list(nvx.HORIZONS.keys()), index=1, horizontal=True,
+            key="horizon_ensemble",
+            help="Court : quelques semaines. Moyen : quelques mois. "
+                 "Long : un an et plus. Seule la fenêtre d'observation "
+                 "change, la méthode est la même.")
+    with barre[1]:
+        st.write("")
+        if st.button("↻ Recalculer", use_container_width=True,
+                     help="Retélécharge les cours et recalcule les seuils. "
+                          "Sans cela ils se rafraîchissent d'eux-mêmes "
+                          "toutes les quinze minutes."):
+            charger_ohlc.clear()
+            charger_cours.clear()
+            st.rerun()
     recap = []
     with st.spinner("Calcul des niveaux…"):
         for t in detenues.index:
             ohlc = charger_ohlc(t)
             if ohlc.empty:
                 continue
-            s = nvx.synthese(ohlc, horizon, float(detenues.at[t, "PRU"])
-                             if np.isfinite(detenues.at[t, "PRU"]) else np.nan)
+            pru_t = (float(detenues.at[t, "PRU"])
+                     if np.isfinite(detenues.at[t, "PRU"]) else np.nan)
+            s = nvx.synthese(ohlc, horizon, pru_t)
             if not s:
                 continue
+
+            valeur = float(detenues.at[t, "Valeur"])
+            part = valeur / total * 100 if total > 0 else np.nan
+            marge = s["Distance stop (%)"]
+            franchi = bool(s["Franchi"])
+
+            # Une ligne franchie n'a plus de perte "si stop" : elle est deja
+            # sortie de son enveloppe. Afficher un nombre a cet endroit,
+            # positif de surcroit, laissait croire a un gain potentiel.
+            cout = np.nan if franchi else valeur * abs(marge) / 100
             recap.append({
                 "Ticker": t,
+                "Statut": ("🔴 franchi" if franchi
+                           else "🟠 proche" if marge > -PROXIMITE_SEUIL
+                           else "🟢 dans l'enveloppe"),
+                "Poids (%)": part,
                 "Cours": float(detenues.at[t, "Cours"]),
-                "ATR (%)": nvx.volatilite_relative(ohlc),
                 "Stop": s["Stop"],
-                "Stop (%)": s["Distance stop (%)"],
+                "Marge (%)": marge,
+                f"Coût ({devise_base})": cout,
+                "Coût / ptf (%)": (np.nan if franchi
+                                   else cout / total * 100 if total > 0
+                                   else np.nan),
                 "Objectif": s["Objectif"],
-                "Objectif (%)": s["Distance objectif (%)"],
-                "Perte si stop": (float(detenues.at[t, "Valeur"])
-                                  * s["Distance stop (%)"] / 100),
-                "Franchi": s["Franchi"]})
+                "Potentiel (%)": s["Distance objectif (%)"],
+                "_franchi": franchi})
 
     if not recap:
         st.caption("Historique insuffisant pour calculer des niveaux.")
     else:
         table_n = pd.DataFrame(recap).set_index("Ticker")
+        # Les decisions d'abord : lignes cassees en tete, puis celles qui
+        # pesent le plus lourd en cas de declenchement.
+        table_n = table_n.sort_values(
+            ["_franchi", "Coût / ptf (%)"], ascending=[False, False])
+
+        casse = table_n[table_n["_franchi"]]
+        saine = table_n[~table_n["_franchi"]]
+        poids_casse = float(casse["Poids (%)"].sum())
+        cout_total = float(saine[f"Coût ({devise_base})"].sum())
+
+        resume = st.columns(3)
+        resume[0].metric("Lignes hors enveloppe", f"{len(casse)} / {len(table_n)}",
+                         f"{poids_casse:.0f} % du portefeuille" if len(casse)
+                         else None, delta_color="inverse")
+        resume[1].metric(
+            "Coût des stops restants",
+            f"{cout_total:,.0f} {devise_base}".replace(",", " "),
+            f"{cout_total / total * 100:.1f} % du portefeuille"
+            if total > 0 else None, delta_color="off")
+        pire = saine["Coût / ptf (%)"].idxmax() if not saine.empty else None
+        resume[2].metric(
+            "Ligne la plus exposée", str(pire) if pire else "—",
+            f"{saine.at[pire, 'Coût / ptf (%)']:.1f} % du portefeuille"
+            if pire else None, delta_color="off")
+
         st.dataframe(
-            table_n.round(2), use_container_width=True,
+            table_n.drop(columns="_franchi").round(2),
+            use_container_width=True,
             column_config={
-                "ATR (%)": st.column_config.NumberColumn(
+                "Statut": st.column_config.TextColumn(
+                    width="small",
+                    help="Franchi : le cours est déjà passé sous le stop. "
+                         "Proche : moins de 3 % de marge."),
+                "Poids (%)": st.column_config.ProgressColumn(
+                    format="%.1f %%", min_value=0,
+                    max_value=float(table_n["Poids (%)"].max() or 100)),
+                "Marge (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%",
+                    help="Baisse encaissable avant de toucher le stop. "
+                         "Positive : le stop est déjà dépassé."),
+                f"Coût ({devise_base})": st.column_config.NumberColumn(
+                    format="%.0f",
+                    help="Perte si ce stop se déclenchait maintenant. Vide "
+                         "pour une ligne déjà hors de son enveloppe."),
+                "Coût / ptf (%)": st.column_config.NumberColumn(
                     format="%.2f %%",
-                    help="Amplitude d'une séance type, en pourcentage du "
-                         "cours. C'est la mesure qui calibre le stop."),
-                "Stop (%)": st.column_config.NumberColumn(format="%+.1f %%"),
-                "Objectif (%)": st.column_config.NumberColumn(format="%+.1f %%"),
-                "Perte si stop": st.column_config.NumberColumn(
-                    format="%+.0f",
-                    help=f"Ce que coûterait le déclenchement de ce stop, en "
-                         f"{devise_base}, au niveau actuel de la position."),
-                "Franchi": st.column_config.CheckboxColumn(
-                    help="Coché : le cours est déjà passé sous ce stop."),
+                    help="La même perte, rapportée au portefeuille entier. "
+                         "C'est le chiffre qui hiérarchise les lignes."),
+                "Potentiel (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%"),
             })
-        perte = float(table_n.loc[~table_n["Franchi"], "Perte si stop"].sum())
-        if total > 0:
-            st.caption(
-                f"Si tous ces stops se déclenchaient le même jour, la perte "
-                f"serait de {abs(perte):,.0f} {devise_base}, soit "
-                f"{abs(perte) / total * 100:.1f} % du portefeuille."
-                .replace(",", " "))
+
+        if len(casse):
+            st.warning(
+                f"**{len(casse)} ligne(s) hors enveloppe — "
+                f"{poids_casse:.0f} % du portefeuille : "
+                f"{', '.join(casse.index)}.** Le cours y est descendu de plus "
+                f"de {nvx.HORIZONS[horizon]['atr']} ATR sous son plus haut de "
+                f"{nvx.HORIZONS[horizon]['fenetre']} séances. Aucun objectif "
+                f"n'est affiché pour elles : il se calculerait sur un risque "
+                f"déjà dépassé. La question n'est plus où placer un stop, mais "
+                f"si la thèse d'investissement tient encore.", icon="🔴")
+
+        ia.bloc(
+            titre=f"Seuils et objectifs — {horizon.lower()}",
+            donnees=table_n.drop(columns="_franchi").round(2),
+            contexte=(
+                f"Portefeuille de {total:,.0f} {devise_base} réparti sur "
+                f"{len(detenues)} lignes. Horizon {horizon.lower()} : stop au "
+                f"plus haut de {nvx.HORIZONS[horizon]['fenetre']} séances "
+                f"moins {nvx.HORIZONS[horizon]['atr']} ATR, objectif à "
+                f"{nvx.HORIZONS[horizon]['gain']} fois le risque pris. "
+                f"{len(casse)} ligne(s) hors enveloppe pesant "
+                f"{poids_casse:.0f} % du portefeuille. Le déclenchement "
+                f"simultané des stops restants coûterait "
+                f"{cout_total / total * 100:.1f} % du portefeuille."
+                .replace(",", " ")),
+            cle_widget="niveaux_ensemble",
+            consignes=ia.CONSIGNES_NIVEAUX)
 
 with onglets_niveaux[1]:
     choix_n = st.selectbox("Valeur", list(detenues.index), key="niveaux_ticker")
