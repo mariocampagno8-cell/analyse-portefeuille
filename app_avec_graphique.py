@@ -854,6 +854,117 @@ if not mvts.empty:
                 "Écart", f"{ecart['ecart']:+,.0f} {devise_base}".replace(",", " "),
                 f"{ecart['ecart_pct']:+.1f} %")
 
+        # --- Courbes comparées
+        # Deux séries d'identité — le portefeuille et l'indice — plus une
+        # ligne de référence recessive pour le capital engagé. La palette
+        # catégorielle est validée sur les deux surfaces ; les versements ne
+        # sont pas une troisième série mais une ligne de flottaison, d'où le
+        # gris et le pointillé.
+        sombre = True
+        try:
+            sombre = str(st.get_option("theme.base") or "dark") != "light"
+        except Exception:
+            pass
+        COULEURS = ({"ptf": "#3987e5", "indice": "#d95926",
+                     "ref": "#8b8a80", "grille": "rgba(255,255,255,0.07)",
+                     "encre": "#c3c2b7"} if sombre else
+                    {"ptf": "#2a78d6", "indice": "#eb6834",
+                     "ref": "#8b8a80", "grille": "rgba(0,0,0,0.07)",
+                     "encre": "#52514e"})
+
+        courbe_indice = (pfm.contrefactuel_quotidien(
+            flux, indice[colonne_indice], calendrier)
+            if colonne_indice else pd.Series(dtype=float))
+        courbe_versements = pfm.versements_cumules(flux, calendrier)
+
+        if len(serie_valeur) > 1:
+            import plotly.graph_objects as go
+
+            figure = go.Figure()
+            figure.add_trace(go.Scatter(
+                x=courbe_versements.index, y=courbe_versements.values,
+                name="Capital engagé", mode="lines",
+                line=dict(color=COULEURS["ref"], width=1.5, dash="dot"),
+                hovertemplate="Capital engagé %{y:,.0f}<extra></extra>"))
+            if not courbe_indice.empty:
+                figure.add_trace(go.Scatter(
+                    x=courbe_indice.index, y=courbe_indice.values,
+                    name=choix_indice.split(" (")[0], mode="lines",
+                    line=dict(color=COULEURS["indice"], width=2),
+                    hovertemplate="Indice %{y:,.0f}<extra></extra>"))
+            figure.add_trace(go.Scatter(
+                x=serie_valeur.index, y=serie_valeur.values,
+                name="Ton portefeuille", mode="lines",
+                line=dict(color=COULEURS["ptf"], width=2),
+                hovertemplate="Portefeuille %{y:,.0f}<extra></extra>"))
+
+            # Étiquettes directes : l'identité ne repose jamais sur la seule
+            # couleur, et le contraste de certaines teintes l'impose.
+            fins = [(serie_valeur, "Portefeuille", COULEURS["ptf"]),
+                    (courbe_indice, choix_indice.split(" (")[0],
+                     COULEURS["indice"])]
+            fins = [(s, l, c) for s, l, c in fins if s is not None and not s.empty]
+
+            # Deux courbes qui finissent au même niveau superposeraient leurs
+            # étiquettes. On les écarte dès que l'écart tombe sous 8 % de
+            # l'amplitude affichée — plotly ne le fait pas seul.
+            amplitude = max(
+                [float(s.max()) for s, _, _ in fins] + [0.0]) - min(
+                [float(s.min()) for s, _, _ in fins] + [0.0])
+            decalages = [0, 0]
+            if len(fins) == 2 and amplitude > 0:
+                a, b = float(fins[0][0].iloc[-1]), float(fins[1][0].iloc[-1])
+                if abs(a - b) < 0.08 * amplitude:
+                    decalages = [10, -10] if a >= b else [-10, 10]
+
+            for (serie, libelle, couleur), dy in zip(fins, decalages):
+                figure.add_annotation(
+                    x=serie.index[-1], y=float(serie.iloc[-1]), yshift=dy,
+                    text=("  " + libelle + " "
+                          + f"{float(serie.iloc[-1]):,.0f}".replace(",", " ")),
+                    showarrow=False, xanchor="left",
+                    font=dict(color=couleur, size=12))
+
+            figure.update_layout(
+                height=380, hovermode="x unified",
+                # Décimale virgule, milliers séparés par une espace fine :
+                # plotly formate à l'anglaise par défaut.
+                separators=",\u202f",
+                margin=dict(l=0, r=150, t=10, b=0),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                            font=dict(color=COULEURS["encre"])),
+                font=dict(color=COULEURS["encre"]),
+                xaxis=dict(showgrid=False, showline=False, ticks="",
+                           # Mois en chiffres : plotly n'a pas de locale
+                           # française, et « Apr 2025 » dans une application
+                           # en français est une faute de finition.
+                           tickformat="%m/%Y",
+                           showspikes=True, spikemode="across",
+                           spikethickness=1, spikedash="dot",
+                           spikecolor=COULEURS["ref"]),
+                # L'unité est rappelée une fois sous le graphique plutôt
+                # qu'à chaque graduation.
+                yaxis=dict(gridcolor=COULEURS["grille"], zeroline=False,
+                           showline=False, ticks="", tickformat=",.0f"))
+            st.plotly_chart(figure, use_container_width=True,
+                            config={"displayModeBar": False})
+            st.caption(
+                f"Valeurs en {devise_base}. Les marches de l'escalier gris "
+                f"sont tes versements : la valeur du portefeuille saute le "
+                f"même jour, sans que ce soit une performance. C'est "
+                f"précisément ce que le rendement pondéré par le temps "
+                f"neutralise.")
+
+            with st.expander("Voir les chiffres"):
+                tableau = pd.DataFrame({
+                    "Capital engagé": courbe_versements,
+                    "Portefeuille": serie_valeur,
+                    choix_indice.split(" (")[0]: courbe_indice})
+                st.dataframe(
+                    tableau.resample("ME").last().round(0)
+                    .rename_axis("Fin de mois"), use_container_width=True)
+
         if contre and ecart:
             if ecart["gagne"]:
                 st.success(
