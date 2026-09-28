@@ -277,6 +277,43 @@ def test_marge_et_resultat_au_stop_ont_des_references_differentes():
     assert r["Résultat au stop (%)"] > 0
 
 
+def test_rsi_sature_aux_bornes():
+    """Que des hausses : 100. Que des baisses : 0. Aucune ambiguïté."""
+    assert proche(nv.rsi(pd.Series(np.arange(100.0, 130.0))).iloc[-1], 100.0, 1e-9)
+    assert proche(nv.rsi(pd.Series(np.arange(130.0, 100.0, -1.0))).iloc[-1],
+                  0.0, 1e-9)
+
+
+def test_rsi_voisin_de_cinquante_sur_une_alternance():
+    alterne = pd.Series([100 + (1 if i % 2 else -1) for i in range(60)],
+                        dtype=float)
+    assert 45 < float(nv.rsi(alterne).iloc[-1]) < 55
+
+
+def test_momentum_est_une_variation_en_pourcentage():
+    c = pd.Series([100.0] * 10 + [110.0] * 10)
+    assert proche(nv.momentum(c, 10).iloc[-1], 10.0, 1e-9)
+
+
+def test_moyenne_mobile_exige_assez_de_points():
+    c = pd.Series([50.0] * 30)
+    mm = nv.moyenne_mobile(c, 20)
+    assert mm.iloc[:19].isna().all()      # pas de valeur avant 20 séances
+    assert proche(mm.iloc[-1], 50.0, 1e-12)
+
+
+def test_atr_et_rsi_partagent_le_meme_lissage():
+    """Le lissage de Wilder est écrit une fois : les deux doivent l'utiliser."""
+    v = pd.Series(np.abs(np.random.default_rng(1).normal(1, 0.3, 100)))
+    manuel = [float(v.iloc[:14].mean())]
+    for i in range(14, 100):
+        manuel.append(manuel[-1] + (float(v.iloc[i]) - manuel[-1]) / 14)
+    obtenu = list(nv._wilder(v, 14).dropna())
+    assert len(obtenu) == len(manuel)
+    for a, b in zip(obtenu, manuel):
+        assert proche(a, b, 1e-12)
+
+
 def test_historique_trop_court_ne_produit_rien():
     assert nv.niveaux(pd.DataFrame()).empty
     assert nv.niveaux(pd.DataFrame({"High": [1, 2], "Low": [1, 2],

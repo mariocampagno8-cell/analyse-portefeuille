@@ -71,17 +71,60 @@ def atr(haut: pd.Series, bas: pd.Series, cloture: pd.Series,
     # ATR = ATR + (amplitude - ATR) / n. Une moyenne exponentielle ordinaire
     # s'amorce sur la premiere amplitude seule et s'ecarte de quelques pour
     # cent pendant une centaine de seances — assez pour deplacer un stop.
-    a = amplitude.to_numpy(dtype=float)
+    return _wilder(amplitude, n)
+
+
+def _wilder(valeurs: pd.Series, n: int) -> pd.Series:
+    """
+    Lissage de Wilder : moyenne des n premieres valeurs, puis recurrence.
+
+    Extrait du calcul de l'ATR, ou il etait deja ecrit. Le RSI emploie le meme
+    lissage — c'est le meme auteur — et une moyenne exponentielle ordinaire
+    donnerait des valeurs proches mais fausses, ce qui est pire que
+    franchement differentes.
+    """
+    a = valeurs.to_numpy(dtype=float)
     sortie = np.full(len(a), np.nan)
     if len(a) < n:
-        return pd.Series(sortie, index=amplitude.index)
+        return pd.Series(sortie, index=valeurs.index)
     courant = float(np.nanmean(a[:n]))
     sortie[n - 1] = courant
     for i in range(n, len(a)):
         if np.isfinite(a[i]):
             courant += (a[i] - courant) / n
         sortie[i] = courant
-    return pd.Series(sortie, index=amplitude.index)
+    return pd.Series(sortie, index=valeurs.index)
+
+
+def moyenne_mobile(cloture: pd.Series, n: int) -> pd.Series:
+    """Moyenne arithmetique simple sur n seances."""
+    return cloture.rolling(n, min_periods=n).mean()
+
+
+def rsi(cloture: pd.Series, n: int = 14) -> pd.Series:
+    """
+    Indice de force relative de Wilder.
+
+    Rapport entre la hausse moyenne et la baisse moyenne des n dernieres
+    seances, ramene sur une echelle de 0 a 100. Au-dela de 70 le titre a
+    beaucoup monte recemment, en deca de 30 beaucoup baisse — ce qui est un
+    constat sur le passe, pas une prevision : un titre en forte tendance
+    reste « surachete » pendant des mois sans se retourner.
+    """
+    variation = cloture.diff()
+    hausses = variation.clip(lower=0.0)
+    baisses = (-variation).clip(lower=0.0)
+    moyenne_hausse = _wilder(hausses, n)
+    moyenne_baisse = _wilder(baisses, n)
+    # Baisse moyenne nulle : que des hausses, le RSI sature a 100.
+    rapport = moyenne_hausse / moyenne_baisse.replace(0.0, np.nan)
+    sortie = 100 - 100 / (1 + rapport)
+    return sortie.where(moyenne_baisse != 0, 100.0)
+
+
+def momentum(cloture: pd.Series, n: int = 20) -> pd.Series:
+    """Variation en pourcentage sur n seances."""
+    return (cloture / cloture.shift(n) - 1) * 100
 
 
 def _dernier(serie: pd.Series) -> float:

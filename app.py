@@ -68,6 +68,14 @@ FENETRE_MOYENNE = rg.FENETRE_MOYENNE
 
 
 st.set_page_config(page_title="FinexResearch", page_icon="◪", layout="wide")
+
+# Le thème décide des teintes des graphiques : les couleurs claires sont
+# délavées sur fond noir, et l'inverse. Détecté une fois, lu partout.
+try:
+    st.session_state["_sombre"] = str(
+        st.get_option("theme.base") or "dark") != "light"
+except Exception:
+    st.session_state["_sombre"] = True
 ac.porte("FinexResearch")
 
 
@@ -215,9 +223,29 @@ def charger_ohlc(ticker: str, periode: str = "2y") -> pd.DataFrame:
             return pd.DataFrame()
         if isinstance(brut.columns, pd.MultiIndex):
             brut.columns = brut.columns.get_level_values(0)
-        return brut[["High", "Low", "Close"]].dropna()
+        colonnes = [c for c in ("Open", "High", "Low", "Close", "Volume")
+                    if c in brut.columns]
+        return brut[colonnes].dropna()
     except Exception:
         return pd.DataFrame()
+
+
+def en_unite_principale(ohlc: pd.DataFrame, devise) -> pd.DataFrame:
+    """
+    Ramene les prix en unite principale, sans toucher au volume.
+
+    Une division globale du tableau diviserait aussi le nombre de titres
+    echanges par cent — une erreur invisible, puisqu'un volume cent fois trop
+    faible reste un nombre plausible.
+    """
+    facteur = facteur_centieme(devise)
+    if facteur == 1 or ohlc is None or ohlc.empty:
+        return ohlc
+    sortie = ohlc.copy()
+    for colonne in ("Open", "High", "Low", "Close"):
+        if colonne in sortie.columns:
+            sortie[colonne] = sortie[colonne] / facteur
+    return sortie
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -623,7 +651,7 @@ with onglets_niveaux[0]:
     recap = []
     with st.spinner("Calcul des niveaux…"):
         for t in detenues.index:
-            ohlc = charger_ohlc(t) / facteur_centieme(monnaies.get(t))
+            ohlc = en_unite_principale(charger_ohlc(t), monnaies.get(t))
             if ohlc.empty:
                 continue
             pru_t = (float(detenues.at[t, "PRU"])
@@ -762,7 +790,8 @@ with onglets_niveaux[0]:
 
 with onglets_niveaux[1]:
     choix_n = st.selectbox("Valeur", list(detenues.index), key="niveaux_ticker")
-    ohlc = charger_ohlc(choix_n) / facteur_centieme(monnaies.get(choix_n))
+    ohlc = en_unite_principale(charger_ohlc(choix_n),
+                               monnaies.get(choix_n))
     if ohlc.empty:
         st.caption("Cours indisponibles pour cette valeur.")
     else:
@@ -776,6 +805,191 @@ with onglets_niveaux[1]:
                    f"{nvx.volatilite_relative(ohlc):.2f} %"
                    + (f" · prix de revient {pru_n:.2f}"
                       if np.isfinite(pru_n) else ""))
+        # --- Chandeliers, moyennes mobiles, volumes et RSI
+        # Le vert/rouge habituel des chandeliers échoue au contrôle daltonien
+        # — écart de 4,1 pour un seuil de 8. La paire bleu/rouge, prévue pour
+        # la polarité, ressort à 19,2, et le corps creux ou plein double
+        # l'information par la forme.
+        TEINTES = ({"hausse": "#3987e5", "baisse": "#e66767",
+                    # Sur fond sombre la teinte la plus claire ressort :
+                    # la MM200, la plus structurante, prend donc le pas le
+                    # plus clair. Sur fond clair, l'ordre s'inverse. Une
+                    # rampe simplement recopiee d'un mode a l'autre rendait
+                    # la MM200 quasi invisible.
+                    "mm": ("#1c5cab", "#3987e5", "#86b6ef"),
+                    "rsi": "#d95926", "reference": "#8b8a80",
+                    "grille": "rgba(255,255,255,0.07)", "encre": "#c3c2b7"}
+                   if st.session_state.get("_sombre", True) else
+                   {"hausse": "#2a78d6", "baisse": "#e34948",
+                    "mm": ("#86b6ef", "#2a78d6", "#104281"),
+                    "rsi": "#eb6834", "reference": "#8b8a80",
+                    "grille": "rgba(0,0,0,0.07)", "encre": "#52514e"})
+
+        reglage = st.columns([2, 1, 1])
+        fenetre_jours = reglage[0].select_slider(
+            "Période affichée", [90, 180, 360, 750],
+            value=360, format_func=lambda j: f"{j // 30} mois" if j < 360
+            else ("1 an" if j == 360 else "3 ans"), key="fenetre_graphe")
+        horizon_trace = reglage[1].selectbox(
+            "Seuils tracés", list(nvx.HORIZONS.keys()), index=1,
+            key="horizon_trace")
+        voir_momentum = reglage[2].checkbox(
+            "Momentum", value=False, key="voir_momentum",
+            help="Variation sur 20 séances. Mesuré sur tes données, il suit "
+                 "le RSI de très près : les deux disent la même chose.")
+
+        vue = ohlc.tail(fenetre_jours)
+        cloture_v = vue["Close"].astype(float)
+
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+
+        rangees = 3 + (1 if voir_momentum else 0)
+        hauteurs = ([0.54, 0.14, 0.22, 0.10] if voir_momentum
+                    else [0.60, 0.15, 0.25])
+        fig = make_subplots(rows=rangees, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.03, row_heights=hauteurs)
+
+        # 1. Chandeliers : corps creux à la hausse, plein à la baisse.
+        fig.add_trace(go.Candlestick(
+            x=vue.index, open=vue["Open"], high=vue["High"],
+            low=vue["Low"], close=vue["Close"], name="Cours",
+            increasing=dict(line=dict(color=TEINTES["hausse"], width=1),
+                            fillcolor="rgba(0,0,0,0)"),
+            decreasing=dict(line=dict(color=TEINTES["baisse"], width=1),
+                            fillcolor=TEINTES["baisse"]),
+            showlegend=False), row=1, col=1)
+
+        # 2. Moyennes mobiles : une famille ordonnée, donc une seule teinte
+        # en trois intensités plutôt que trois couleurs sans rapport.
+        for (periode, couleur) in zip((20, 50, 200), TEINTES["mm"]):
+            serie_mm = nvx.moyenne_mobile(ohlc["Close"].astype(float),
+                                          periode).reindex(vue.index)
+            if serie_mm.notna().sum() < 2:
+                continue
+            fig.add_trace(go.Scatter(
+                x=serie_mm.index, y=serie_mm.values, name=f"MM{periode}",
+                mode="lines", line=dict(color=couleur, width=1.6),
+                hovertemplate=f"MM{periode} %{{y:,.2f}}<extra></extra>"),
+                row=1, col=1)
+
+        # 3. Seuils de l'horizon choisi, plus le prix de revient.
+        ligne_h = detail[detail["Horizon"] == horizon_trace]
+        if not ligne_h.empty:
+            r_h = ligne_h.iloc[0]
+            reperes = [(r_h["Stop"], f"Stop {horizon_trace.lower()}",
+                        TEINTES["baisse"])]
+            if np.isfinite(r_h["Objectif"]):
+                reperes.append((r_h["Objectif"], "Objectif",
+                                TEINTES["hausse"]))
+            if np.isfinite(pru_n):
+                reperes.append((pru_n, "Prix de revient",
+                                TEINTES["reference"]))
+            for niveau, libelle, couleur in reperes:
+                fig.add_trace(go.Scatter(
+                    x=[vue.index[0], vue.index[-1]],
+                    y=[float(niveau), float(niveau)], name=libelle,
+                    mode="lines",
+                    line=dict(color=couleur, width=1, dash="dash"),
+                    hovertemplate=libelle + " %{y:,.2f}<extra></extra>"),
+                    row=1, col=1)
+                fig.add_annotation(
+                    x=vue.index[-1], y=float(niveau), yshift=8,
+                    text=f"{libelle} {float(niveau):,.2f}".replace(",", " "),
+                    showarrow=False, xanchor="right",
+                    font=dict(color=couleur, size=11), row=1, col=1)
+
+        # 4. Volumes, colorés par le sens de la séance.
+        if "Volume" in vue.columns:
+            sens = (vue["Close"] >= vue["Open"])
+            fig.add_trace(go.Bar(
+                x=vue.index, y=vue["Volume"], name="Volume",
+                marker=dict(color=[TEINTES["hausse"] if h else TEINTES["baisse"]
+                                   for h in sens], line_width=0),
+                opacity=0.55, showlegend=False,
+                hovertemplate="Volume %{y:,.0f}<extra></extra>"),
+                row=2, col=1)
+            fig.add_annotation(x=0, y=1, xref="x2 domain", yref="y2 domain",
+                               text="Volume échangé", showarrow=False,
+                               xanchor="left", yanchor="top",
+                               font=dict(color=TEINTES["encre"], size=11))
+
+        # 5. RSI, avec ses bornes conventionnelles.
+        serie_rsi = nvx.rsi(ohlc["Close"].astype(float)).reindex(vue.index)
+        fig.add_trace(go.Scatter(
+            x=serie_rsi.index, y=serie_rsi.values, name="RSI 14",
+            mode="lines", line=dict(color=TEINTES["rsi"], width=1.6),
+            showlegend=False,
+            hovertemplate="RSI %{y:.0f}<extra></extra>"), row=3, col=1)
+        fig.add_annotation(x=0, y=1, xref="x3 domain", yref="y3 domain",
+                           text="RSI 14", showarrow=False, xanchor="left",
+                           yanchor="top",
+                           font=dict(color=TEINTES["rsi"], size=11))
+        for borne in (30, 70):
+            fig.add_hline(y=borne, line_width=1, line_dash="dot",
+                          line_color=TEINTES["reference"], row=3, col=1)
+
+        if voir_momentum:
+            serie_mom = nvx.momentum(ohlc["Close"].astype(float),
+                                     20).reindex(vue.index)
+            fig.add_trace(go.Scatter(
+                x=serie_mom.index, y=serie_mom.values, name="Momentum 20",
+                mode="lines", line=dict(color=TEINTES["rsi"], width=1.6),
+                showlegend=False,
+                hovertemplate="Momentum %{y:+.1f} %<extra></extra>"),
+                row=4, col=1)
+            fig.add_annotation(x=0, y=1, xref="x4 domain", yref="y4 domain",
+                               text="Momentum 20 séances", showarrow=False,
+                               xanchor="left", yanchor="top",
+                               font=dict(color=TEINTES["rsi"], size=11))
+            fig.add_hline(y=0, line_width=1, line_dash="dot",
+                          line_color=TEINTES["reference"], row=4, col=1)
+
+        fig.update_layout(
+            height=620 if voir_momentum else 560, separators=", ",
+            margin=dict(l=0, r=10, t=10, b=0), hovermode="x unified",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color=TEINTES["encre"]),
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0,
+                        font=dict(color=TEINTES["encre"])),
+            xaxis_rangeslider_visible=False)
+        fig.update_xaxes(showgrid=False, showline=False, ticks="",
+                         tickformat="%m/%Y")
+        fig.update_yaxes(gridcolor=TEINTES["grille"], zeroline=False,
+                         showline=False, ticks="", tickformat=",.0f")
+        fig.update_yaxes(title_text="", row=2, col=1, showticklabels=False)
+        fig.update_yaxes(range=[0, 100], dtick=25, row=3, col=1)
+
+        # Échelle des cours fixée sur les données plutôt que laissée à
+        # l'ajustement automatique : un repère absent — l'objectif n'existe
+        # pas quand le stop est franchi — suffisait à étirer l'axe jusqu'à
+        # zéro et à écraser les chandeliers en haut de la case.
+        niveaux_traces = [float(vue["Low"].min()), float(vue["High"].max())]
+        if not ligne_h.empty:
+            niveaux_traces.append(float(r_h["Stop"]))
+            if np.isfinite(r_h["Objectif"]):
+                niveaux_traces.append(float(r_h["Objectif"]))
+        if np.isfinite(pru_n):
+            niveaux_traces.append(float(pru_n))
+        fig.update_yaxes(range=[min(niveaux_traces) * 0.96,
+                                max(niveaux_traces) * 1.04], row=1, col=1)
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"displayModeBar": False})
+
+        paire = pd.concat([serie_rsi, nvx.momentum(
+            ohlc["Close"].astype(float), 20).reindex(vue.index)],
+            axis=1).dropna()
+        redondance = (float(paire.corr().iloc[0, 1]) if len(paire) > 30
+                      else np.nan)
+        st.caption(
+            "Corps creux : séance en hausse. Corps plein : séance en baisse. "
+            "Les moyennes mobiles vont du clair au foncé avec la période — "
+            "20, 50, 200 séances."
+            + (f" Sur cette valeur, RSI et momentum sont corrélés à "
+               f"{redondance:.2f} : ils disent la même chose."
+               if np.isfinite(redondance) else ""))
+
+
         for _, r in detail.iterrows():
             with st.container(border=True):
                 gauche, milieu, droite = st.columns([2, 2, 3])
@@ -906,11 +1120,7 @@ if not mvts.empty:
         # catégorielle est validée sur les deux surfaces ; les versements ne
         # sont pas une troisième série mais une ligne de flottaison, d'où le
         # gris et le pointillé.
-        sombre = True
-        try:
-            sombre = str(st.get_option("theme.base") or "dark") != "light"
-        except Exception:
-            pass
+        sombre = st.session_state.get("_sombre", True)
         COULEURS = ({"ptf": "#3987e5", "indice": "#d95926",
                      "ref": "#8b8a80", "grille": "rgba(255,255,255,0.07)",
                      "encre": "#c3c2b7"} if sombre else
