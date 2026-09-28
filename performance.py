@@ -235,6 +235,45 @@ def contrefactuel(flux: pd.Series, cours_indice: pd.Series) -> dict:
             "rendement": finale / investi - 1 if investi > 0 else np.nan}
 
 
+def contrefactuel_quotidien(flux: pd.Series, cours_indice: pd.Series,
+                            dates: pd.DatetimeIndex) -> pd.Series:
+    """
+    Valeur du contrefactuel jour par jour, pour tracer la courbe.
+
+    Meme logique que `contrefactuel`, mais on conserve le nombre de parts
+    apres chaque flux au lieu de n'en garder que le total : la comparaison
+    visuelle vaut mieux que deux nombres finaux, parce qu'elle montre a quel
+    moment l'ecart s'est creuse.
+    """
+    serie = cours_indice.dropna() if cours_indice is not None else pd.Series(dtype=float)
+    if flux is None or flux.empty or serie.empty or len(dates) == 0:
+        return pd.Series(dtype=float)
+
+    prix = serie.reindex(dates.union(serie.index)).ffill().reindex(dates)
+    parts, sortie = 0.0, []
+    restants = flux.sort_index()
+    i = 0
+    for jour in dates:
+        while i < len(restants) and \
+                pd.Timestamp(restants.index[i]).normalize() <= jour:
+            p = prix.get(jour, np.nan)
+            if np.isfinite(p) and p > 0:
+                parts = max(0.0, parts + float(restants.iloc[i]) / float(p))
+            i += 1
+        sortie.append(parts * float(prix.get(jour, np.nan)))
+    return pd.Series(sortie, index=dates)
+
+
+def versements_cumules(flux: pd.Series, dates: pd.DatetimeIndex) -> pd.Series:
+    """Capital net engage a chaque date : la ligne de flottaison."""
+    if flux is None or flux.empty or len(dates) == 0:
+        return pd.Series(dtype=float)
+    serie = flux.copy()
+    serie.index = pd.to_datetime(serie.index).normalize()
+    return serie.groupby(level=0).sum().reindex(
+        dates.union(serie.index)).fillna(0.0).cumsum().reindex(dates).ffill()
+
+
 def comparaison(valeur_reelle: float, contre: dict) -> dict:
     """Ecart entre le portefeuille et son contrefactuel, en euros et en %."""
     if not contre or not np.isfinite(valeur_reelle):

@@ -436,6 +436,30 @@ def test_contrefactuel_achete_des_parts_au_cours_du_jour():
     assert proche(c["rendement"], 1.0, 1e-9)
 
 
+def test_contrefactuel_quotidien_finit_sur_le_total():
+    """La courbe et le calcul final doivent se rejoindre au dernier point."""
+    d = pd.bdate_range("2025-01-01", periods=100)
+    indice = pd.Series(np.linspace(100.0, 200.0, 100), index=d)
+    flux = pd.Series({d[0]: 1000.0, d[49]: 1000.0})
+    courbe = pf.contrefactuel_quotidien(flux, indice, d)
+    assert proche(courbe.iloc[-1], pf.contrefactuel(flux, indice)["valeur"], 1e-6)
+    # Premier jour : 1 000 / 100 = 10 parts, soit 10 x 100
+    assert proche(courbe.iloc[0], 1000.0, 1e-9)
+    # Au versement suivant, les parts s'ajoutent au cours du jour
+    p = float(indice.iloc[49])
+    assert proche(courbe.iloc[49], (10 + 1000 / p) * p, 1e-9)
+
+
+def test_versements_cumules_en_escalier():
+    d = pd.bdate_range("2025-01-01", periods=100)
+    flux = pd.Series({d[0]: 1000.0, d[49]: 500.0, d[80]: -300.0})
+    v = pf.versements_cumules(flux, d)
+    assert proche(v.iloc[0], 1000.0)
+    assert proche(v.iloc[48], 1000.0)
+    assert proche(v.iloc[49], 1500.0)
+    assert proche(v.iloc[-1], 1200.0)
+
+
 def test_comparaison_signale_le_sens_de_l_ecart():
     c = {"valeur": 1000.0, "investi": 800.0, "rendement": 0.25, "parts": 1.0}
     assert pf.comparaison(1200.0, c)["gagne"] is True
