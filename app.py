@@ -35,7 +35,6 @@ import analytics as an
 import feuille as fe
 import google_prive as gpv
 import analyse as ia
-import dimension as dm
 import mouvements as mo
 import niveaux as nvx
 import performance as pfm
@@ -716,8 +715,7 @@ st.dataframe(
 st.divider()
 st.subheader("Stops et objectifs")
 
-onglets_niveaux = st.tabs(["Vue d'ensemble", "Détail d'une ligne",
-                           "Combien acheter"])
+onglets_niveaux = st.tabs(["Vue d'ensemble", "Détail d'une ligne"])
 
 with onglets_niveaux[0]:
     barre = st.columns([4, 1])
@@ -902,106 +900,6 @@ with onglets_niveaux[1]:
                 if r["Sous le PRU"] is True:
                     gauche.caption("⚠️ ce stop est sous ton prix de revient : "
                                    "il entérinerait une perte.")
-
-with onglets_niveaux[2]:
-    st.caption(
-        "Le risque d'une ligne n'est pas sa taille, c'est sa taille "
-        "multipliée par la distance à son stop. On fixe donc d'abord ce qu'on "
-        "accepte de perdre, et la taille s'en déduit.")
-
-    reglages = st.columns(2)
-    budget = reglages[0].slider(
-        "Perte acceptée par idée (% du portefeuille)", 0.25,
-        dm.RISQUE_MAX, dm.RISQUE_DEFAUT, 0.25, key="budget_risque",
-        help="La littérature de gestion situe ce chiffre entre 0,5 et 2 % "
-             "pour un particulier, sans qu'aucune valeur précise ne soit "
-             "démontrée.")
-    plafond = reglages[1].slider(
-        "Taille maximale d'une ligne (% du portefeuille)", 5.0, 40.0,
-        dm.PLAFOND_LIGNE, 2.5, key="plafond_ligne",
-        help="Garde-fou indépendant du stop : un seuil serré ne protège pas "
-             "d'une ouverture en décalage, où le cours saute par-dessus.")
-
-    st.markdown("**Une idée à dimensionner**")
-    saisie = st.columns(3)
-    cours_idee = saisie[0].number_input(
-        "Cours d'achat", min_value=0.0, value=100.0, step=1.0,
-        key="dim_cours")
-    stop_idee = saisie[1].number_input(
-        "Stop envisagé", min_value=0.0, value=92.0, step=1.0, key="dim_stop",
-        help="Reprends celui de l'onglet Vue d'ensemble, ou fixe le tien.")
-    saisie[2].write("")
-    if cours_idee > 0 and 0 < stop_idee < cours_idee and total > 0:
-        r = dm.taille(total, cours_idee, stop_idee, budget, plafond)
-        res = st.columns(4)
-        res[0].metric("À acheter", f"{r['titres']} titres")
-        res[1].metric("Montant",
-                      f"{r['montant']:,.0f} {devise_base}".replace(",", " "),
-                      f"{r['part']:.1f} % du portefeuille", delta_color="off")
-        res[2].metric("Perte si le stop tombe",
-                      f"{r['perte']:,.0f} {devise_base}".replace(",", " "),
-                      f"{r['perte'] / total * 100:.2f} % du portefeuille",
-                      delta_color="inverse")
-        res[3].metric("Distance au stop", f"{r['distance']:.1f} %")
-        if r["limite"] == "taille":
-            st.info(
-                f"C'est le plafond de taille qui limite, pas le risque : "
-                f"avec un stop à {r['distance']:.1f} %, le budget de "
-                f"{budget:.2f} % autoriserait une ligne bien plus grosse. "
-                f"Un stop proche invite à surdimensionner — et ne protège pas "
-                f"d'une ouverture en décalage.", icon="ℹ️")
-    else:
-        st.caption("Renseigne un stop strictement inférieur au cours.")
-
-    st.divider()
-    st.markdown("**Tes lignes actuelles, mesurées à ce budget**")
-
-    # Le tableau des positions porte deja une colonne Stop — celle du stop
-    # simple du tableau de bord — alors que le budget doit s'appuyer sur le
-    # stop de l'horizon choisi. Une jointure faisait donc collision de noms.
-    # On assemble explicitement les trois colonnes necessaires.
-    niveaux_stop = (pd.DataFrame(recap).set_index("Ticker")
-                    if recap else pd.DataFrame(columns=["Stop"]))
-    base = pd.DataFrame({
-        "Valeur": detenues["Valeur"],
-        "Cours": detenues["Cours"],
-        "Stop": niveaux_stop["Stop"].reindex(detenues.index)
-        if "Stop" in niveaux_stop.columns else np.nan,
-    }).dropna(subset=["Cours", "Stop"])
-
-    if base.empty:
-        st.caption("Ouvre l'onglet Vue d'ensemble pour calculer les stops.")
-    else:
-        b = dm.budget_respecte(base, budget, plafond)
-        st.dataframe(
-            b.round(2), use_container_width=True,
-            column_config={
-                "Poids (%)": st.column_config.NumberColumn(format="%.1f %%"),
-                "Risque (%)": st.column_config.NumberColumn(
-                    format="%.2f %%",
-                    help="Ce que cette ligne ferait perdre au portefeuille si "
-                         "son stop tombait."),
-                "Budget (%)": st.column_config.NumberColumn(format="%.2f %%"),
-                "Valeur cible": st.column_config.NumberColumn(format="%.0f"),
-                "À alléger": st.column_config.NumberColumn(
-                    format="%.0f",
-                    help="Montant à vendre pour rentrer dans le budget. "
-                         "Vide si la ligne le respecte déjà."),
-                "Franchi": st.column_config.CheckboxColumn(
-                    help="Stop déjà dépassé : la perte n'est plus une "
-                         "hypothèse, le budget ne s'applique plus."),
-            })
-        hors = b[(~b["Franchi"]) & (b["À alléger"] > 0)]
-        if not hors.empty:
-            st.warning(
-                f"**{len(hors)} ligne(s) au-dessus du budget, "
-                f"{hors['À alléger'].sum():,.0f} {devise_base} à alléger pour "
-                f"les y ramener.** Un arbitrage déclenche le prélèvement "
-                f"forfaitaire unique de 30 % sur la plus-value : chiffre le "
-                f"coût fiscal avant de décider, il annule parfois le "
-                f"bénéfice de l'ajustement.".replace(",", " "), icon="⚖️")
-        else:
-            st.success("Toutes tes lignes tiennent dans ce budget.", icon="✓")
 
 st.caption(
     "Les stops suivent la méthode du chandelier : plus haut de la période "

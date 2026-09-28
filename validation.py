@@ -212,7 +212,10 @@ def controler_positions(positions: pd.DataFrame, valeurs: pd.Series,
                         cours_connus: set) -> list[dict]:
     """Tickers introuvables, quantites nulles, concentration excessive."""
     anomalies = []
-    if positions is None or positions.empty:
+    # `.empty` vaut vrai pour un tableau qui a des lignes mais aucune colonne,
+    # et les controles ci-dessous ne portent que sur l'index : tester la
+    # longueur de l'index evite de sortir sans rien verifier.
+    if positions is None or len(positions.index) == 0:
         return anomalies
 
     for t in positions.index:
