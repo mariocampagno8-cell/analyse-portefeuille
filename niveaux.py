@@ -1,0 +1,167 @@
+"""
+Seuils de vente et objectifs, a trois horizons.
+
+Le principe est le meme aux trois echelles, seule la fenetre change : un stop
+suiveur accroche au plus haut recent et ecarte d'un multiple de la volatilite
+reelle du titre, un objectif exprime en multiple du risque effectivement pris.
+
+Sur la valeur de ces deux familles de niveaux, il faut etre clair, parce que
+les traiter comme equivalentes serait trompeur.
+
+Le stop est defendable. Il repose sur l'ATR, mesure de l'amplitude moyenne des
+seances, et sur la methode dite du chandelier (LeBeau) : plus haut de la
+periode moins k fois l'ATR. Son merite n'est pas de predire quoi que ce soit
+mais de dimensionner la tolerance au bruit propre a chaque titre — un seuil a
+8 % sur une valeur qui bouge de 1 % par jour et a 30 % sur une valeur qui
+bouge de 6 % ont la meme signification statistique. C'est un outil de
+controle du risque, et c'est a ce titre qu'il est utile.
+
+L'objectif est beaucoup plus faible. Aucune methode ne sait ou un titre va
+s'arreter de monter, et les cibles tirees des extensions de Fibonacci ou des
+projections de figures n'ont pas de fondement empirique serieux. Ce qui est
+retenu ici est donc volontairement modeste : un multiple du risque pris, qui
+ne dit pas ou ira le cours mais a partir de quel gain la position a paye son
+propre risque. C'est une regle de gestion, pas une prevision. La resistance
+structurelle est affichee a cote, a titre d'information sur le niveau ou des
+vendeurs se sont deja manifestes.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+# Fenetre d'observation, multiple d'ATR pour le stop, multiple de risque pour
+# l'objectif. Le multiple d'ATR croit avec l'horizon : un stop de long terme
+# doit survivre a des corrections qui n'ont pas de sens a court terme.
+HORIZONS = {
+    "Court terme": {"fenetre": 22, "atr": 2.5, "gain": 1.5,
+                    "duree": "quelques semaines"},
+    "Moyen terme": {"fenetre": 55, "atr": 3.0, "gain": 2.5,
+                    "duree": "quelques mois"},
+    "Long terme": {"fenetre": 120, "atr": 3.5, "gain": 4.0,
+                   "duree": "un an et plus"},
+}
+
+PERIODE_ATR = 14
+
+
+def atr(haut: pd.Series, bas: pd.Series, cloture: pd.Series,
+        n: int = PERIODE_ATR) -> pd.Series:
+    """
+    Amplitude vraie moyenne, lissage de Wilder.
+
+    L'amplitude vraie d'une seance est le plus grand des trois ecarts : haut
+    moins bas, haut moins cloture veille, bas moins cloture veille. Les deux
+    derniers capturent les ouvertures en decalage, qu'un simple haut moins bas
+    ignorerait — c'est precisement ce qui fait sauter les stops.
+    """
+    veille = cloture.shift(1)
+    amplitude = pd.concat([haut - bas,
+                           (haut - veille).abs(),
+                           (bas - veille).abs()], axis=1).max(axis=1)
+
+    # Lissage de Wilder, amorce comprise : la premiere valeur est la moyenne
+    # simple des n premieres amplitudes, les suivantes suivent la recurrence
+    # ATR = ATR + (amplitude - ATR) / n. Une moyenne exponentielle ordinaire
+    # s'amorce sur la premiere amplitude seule et s'ecarte de quelques pour
+    # cent pendant une centaine de seances — assez pour deplacer un stop.
+    a = amplitude.to_numpy(dtype=float)
+    sortie = np.full(len(a), np.nan)
+    if len(a) < n:
+        return pd.Series(sortie, index=amplitude.index)
+    courant = float(np.nanmean(a[:n]))
+    sortie[n - 1] = courant
+    for i in range(n, len(a)):
+        if np.isfinite(a[i]):
+            courant += (a[i] - courant) / n
+        sortie[i] = courant
+    return pd.Series(sortie, index=amplitude.index)
+
+
+def _dernier(serie: pd.Series) -> float:
+    valeurs = serie.dropna()
+    return float(valeurs.iloc[-1]) if len(valeurs) else np.nan
+
+
+def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
+    """
+    Trois horizons, un stop et un objectif chacun.
+
+    `ohlc` porte les colonnes High, Low, Close. `pru` sert uniquement a dire
+    si le stop protege encore un gain ou entérine déjà une perte.
+    """
+    colonnes = ["Horizon", "Stop", "Distance stop (%)", "Objectif",
+                "Distance objectif (%)", "Risque (%)", "Gain visé (%)",
+                "Résistance", "Support", "Franchi", "Sous le PRU"]
+    if ohlc is None or ohlc.empty or len(ohlc) < 40:
+        return pd.DataFrame(columns=colonnes)
+
+    haut, bas = ohlc["High"].astype(float), ohlc["Low"].astype(float)
+    cloture = ohlc["Close"].astype(float)
+    actuel = float(cloture.dropna().iloc[-1])
+    a = _dernier(atr(haut, bas, cloture))
+    if not np.isfinite(a) or a <= 0:
+        return pd.DataFrame(columns=colonnes)
+
+    lignes = []
+    for nom, p in HORIZONS.items():
+        f = min(p["fenetre"], len(cloture))
+        plus_haut = float(haut.tail(f).max())
+        plus_bas = float(bas.tail(f).min())
+
+        # Stop du chandelier, sans autre correction que la garantie d'etre
+        # sous le cours. Un premier essai le bornait par le creux de la
+        # periode, pour ne pas accepter une perte superieure au dernier repli
+        # connu ; en tendance haussiere ce creux se situe juste sous le cours
+        # et ecrasait les trois horizons a la meme valeur. Le creux reste
+        # affiche a titre indicatif, il ne contraint plus le calcul.
+        stop = plus_haut - p["atr"] * a
+
+        # Un stop au-dessus du cours signifie que le titre a deja perdu plus
+        # que sa tolerance au bruit depuis son plus haut : le seuil est
+        # franchi. Le ramener sous le cours donnerait l'illusion d'une
+        # position encore dans son enveloppe de risque. On le laisse ou il est
+        # et on le signale ; l'objectif, lui, n'a plus de sens, puisqu'il se
+        # calcule a partir d'un risque que la position a deja depasse.
+        franchi = stop >= actuel
+        risque = np.nan if franchi else (actuel - stop) / actuel * 100
+        objectif = (np.nan if franchi
+                    else actuel + p["gain"] * (actuel - stop))
+
+        lignes.append({
+            "Horizon": nom,
+            "Stop": stop,
+            "Distance stop (%)": (stop / actuel - 1) * 100,
+            "Objectif": objectif,
+            "Distance objectif (%)": (np.nan if franchi
+                                      else (objectif / actuel - 1) * 100),
+            "Risque (%)": risque,
+            "Gain visé (%)": np.nan if franchi else p["gain"] * risque,
+            "Résistance": plus_haut,
+            "Support": plus_bas,
+            "Franchi": bool(franchi),
+            "Sous le PRU": (bool(stop < pru) if np.isfinite(pru) and pru > 0
+                            else None)})
+
+    return pd.DataFrame(lignes)[colonnes]
+
+
+def synthese(ohlc: pd.DataFrame, horizon: str = "Moyen terme",
+             pru: float = np.nan) -> dict:
+    """Les chiffres d'un seul horizon, pour un tableau recapitulatif."""
+    table = niveaux(ohlc, pru)
+    if table.empty:
+        return {}
+    ligne = table[table["Horizon"] == horizon]
+    return ligne.iloc[0].to_dict() if not ligne.empty else {}
+
+
+def volatilite_relative(ohlc: pd.DataFrame) -> float:
+    """ATR rapporte au cours, en pourcentage : l'amplitude d'une seance type."""
+    if ohlc is None or ohlc.empty or len(ohlc) < 40:
+        return np.nan
+    a = _dernier(atr(ohlc["High"].astype(float), ohlc["Low"].astype(float),
+                     ohlc["Close"].astype(float)))
+    actuel = float(ohlc["Close"].dropna().iloc[-1])
+    return a / actuel * 100 if actuel > 0 else np.nan

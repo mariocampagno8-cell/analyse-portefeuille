@@ -35,6 +35,7 @@ import analytics as an
 import feuille as fe
 import google_prive as gpv
 import mouvements as mo
+import niveaux as nvx
 
 ONGLET_MOUVEMENTS = "MOUVEMENTS"
 
@@ -211,6 +212,28 @@ def charger_cours(tickers: tuple[str, ...], periode: str = "1y") -> pd.DataFrame
     cours = (brut["Close"] if isinstance(brut.columns, pd.MultiIndex)
              else brut[["Close"]].rename(columns={"Close": tickers[0]}))
     return cours.dropna(how="all").ffill()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def charger_ohlc(ticker: str, periode: str = "2y") -> pd.DataFrame:
+    """
+    Hauts, bas et clotures d'une valeur.
+
+    L'ATR a besoin des extremes de seance : le seul cours de cloture ignore
+    les ouvertures en decalage, qui sont precisement ce qui declenche les
+    stops. Le telechargement se fait valeur par valeur pour que l'echec de
+    l'une n'emporte pas les autres.
+    """
+    try:
+        brut = yf.download(ticker, period=periode, interval="1d",
+                           auto_adjust=True, progress=False)
+        if brut.empty:
+            return pd.DataFrame()
+        if isinstance(brut.columns, pd.MultiIndex):
+            brut.columns = brut.columns.get_level_values(0)
+        return brut[["High", "Low", "Close"]].dropna()
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -638,6 +661,120 @@ st.dataframe(
         "Manuel": st.column_config.CheckboxColumn(
             help="Coché : le stop vient de ta feuille. Décoché : il est calculé."),
     })
+
+# --- Stops et objectifs par horizon
+st.divider()
+st.subheader("Stops et objectifs")
+
+onglets_niveaux = st.tabs(["Vue d'ensemble", "Détail d'une ligne"])
+
+with onglets_niveaux[0]:
+    horizon = st.radio("Horizon", list(nvx.HORIZONS.keys()), index=1,
+                       horizontal=True, key="horizon_ensemble",
+                       help="Court : quelques semaines. Moyen : quelques mois. "
+                            "Long : un an et plus. Seule la fenêtre "
+                            "d'observation change, la méthode est la même.")
+    recap = []
+    with st.spinner("Calcul des niveaux…"):
+        for t in detenues.index:
+            ohlc = charger_ohlc(t)
+            if ohlc.empty:
+                continue
+            s = nvx.synthese(ohlc, horizon, float(detenues.at[t, "PRU"])
+                             if np.isfinite(detenues.at[t, "PRU"]) else np.nan)
+            if not s:
+                continue
+            recap.append({
+                "Ticker": t,
+                "Cours": float(detenues.at[t, "Cours"]),
+                "ATR (%)": nvx.volatilite_relative(ohlc),
+                "Stop": s["Stop"],
+                "Stop (%)": s["Distance stop (%)"],
+                "Objectif": s["Objectif"],
+                "Objectif (%)": s["Distance objectif (%)"],
+                "Perte si stop": (float(detenues.at[t, "Valeur"])
+                                  * s["Distance stop (%)"] / 100),
+                "Franchi": s["Franchi"]})
+
+    if not recap:
+        st.caption("Historique insuffisant pour calculer des niveaux.")
+    else:
+        table_n = pd.DataFrame(recap).set_index("Ticker")
+        st.dataframe(
+            table_n.round(2), use_container_width=True,
+            column_config={
+                "ATR (%)": st.column_config.NumberColumn(
+                    format="%.2f %%",
+                    help="Amplitude d'une séance type, en pourcentage du "
+                         "cours. C'est la mesure qui calibre le stop."),
+                "Stop (%)": st.column_config.NumberColumn(format="%+.1f %%"),
+                "Objectif (%)": st.column_config.NumberColumn(format="%+.1f %%"),
+                "Perte si stop": st.column_config.NumberColumn(
+                    format="%+.0f",
+                    help=f"Ce que coûterait le déclenchement de ce stop, en "
+                         f"{devise_base}, au niveau actuel de la position."),
+                "Franchi": st.column_config.CheckboxColumn(
+                    help="Coché : le cours est déjà passé sous ce stop."),
+            })
+        perte = float(table_n.loc[~table_n["Franchi"], "Perte si stop"].sum())
+        if total > 0:
+            st.caption(
+                f"Si tous ces stops se déclenchaient le même jour, la perte "
+                f"serait de {abs(perte):,.0f} {devise_base}, soit "
+                f"{abs(perte) / total * 100:.1f} % du portefeuille."
+                .replace(",", " "))
+
+with onglets_niveaux[1]:
+    choix_n = st.selectbox("Valeur", list(detenues.index), key="niveaux_ticker")
+    ohlc = charger_ohlc(choix_n)
+    if ohlc.empty:
+        st.caption("Cours indisponibles pour cette valeur.")
+    else:
+        pru_n = (float(detenues.at[choix_n, "PRU"])
+                 if np.isfinite(detenues.at[choix_n, "PRU"]) else np.nan)
+        detail = nvx.niveaux(ohlc, pru_n)
+        actuel_n = float(ohlc["Close"].iloc[-1])
+        st.caption(f"Cours {actuel_n:.2f} · amplitude moyenne d'une séance "
+                   f"{nvx.volatilite_relative(ohlc):.2f} %"
+                   + (f" · prix de revient {pru_n:.2f}"
+                      if np.isfinite(pru_n) else ""))
+        for _, r in detail.iterrows():
+            with st.container(border=True):
+                gauche, milieu, droite = st.columns([2, 2, 3])
+                gauche.markdown(f"**{r['Horizon']}**")
+                gauche.caption(nvx.HORIZONS[r["Horizon"]]["duree"])
+                if r["Franchi"]:
+                    milieu.metric("Stop", f"{r['Stop']:.2f}",
+                                  "déjà franchi", delta_color="inverse")
+                    droite.caption(
+                        "Le cours est descendu de plus de "
+                        f"{nvx.HORIZONS[r['Horizon']]['atr']} ATR sous son "
+                        f"plus haut de {nvx.HORIZONS[r['Horizon']]['fenetre']} "
+                        "séances. À cet horizon, la position est sortie de son "
+                        "enveloppe de risque : l'objectif n'a plus de sens.")
+                else:
+                    milieu.metric("Stop", f"{r['Stop']:.2f}",
+                                  f"{r['Distance stop (%)']:+.1f} %",
+                                  delta_color="inverse")
+                    droite.metric("Objectif", f"{r['Objectif']:.2f}",
+                                  f"{r['Distance objectif (%)']:+.1f} %")
+                    droite.caption(
+                        f"Risque {r['Risque (%)']:.1f} % pour un gain visé de "
+                        f"{r['Gain visé (%)']:.1f} % · résistance récente "
+                        f"{r['Résistance']:.2f}, support {r['Support']:.2f}")
+                if r["Sous le PRU"] is True:
+                    gauche.caption("⚠️ ce stop est sous ton prix de revient : "
+                                   "il entérinerait une perte.")
+
+st.caption(
+    "Les stops suivent la méthode du chandelier : plus haut de la période "
+    "diminué d'un multiple de l'ATR, la mesure d'amplitude des séances. Ils "
+    "dimensionnent la tolérance au bruit propre à chaque titre. Les objectifs "
+    "sont un multiple du risque pris — 1,5 fois à court terme, 4 fois à long "
+    "terme — et non une prévision de cours : aucune méthode ne sait où un "
+    "titre s'arrêtera de monter."
+)
+
 
 # --- Positions soldées
 soldees = mo.cloturees(etat_journal)
