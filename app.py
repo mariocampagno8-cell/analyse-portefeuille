@@ -38,6 +38,7 @@ import analyse as ia
 import dimension as dm
 import mouvements as mo
 import niveaux as nvx
+import performance as pfm
 import reglages as rg
 import validation as val
 
@@ -1001,6 +1002,110 @@ st.caption(
     "terme — et non une prévision de cours : aucune méthode ne sait où un "
     "titre s'arrêtera de monter."
 )
+
+
+# ==========================================================================
+# Performance contre un indice
+# ==========================================================================
+
+INDICES = {
+    "MSCI World (IWDA.AS)": "IWDA.AS",
+    "S&P 500 (CSPX.AS)": "CSPX.AS",
+    "Nasdaq 100 (CNDX.AS)": "CNDX.AS",
+    "CAC 40 (^FCHI)": "^FCHI",
+    "MSCI Europe (IMEU.AS)": "IMEU.AS",
+}
+
+if not mvts.empty:
+    st.divider()
+    st.subheader("Performance")
+
+    choix_indice = st.selectbox(
+        "Comparer à", list(INDICES.keys()), key="indice_reference",
+        help="Les mêmes versements, aux mêmes dates, placés sur cet indice.")
+
+    debut = pd.Timestamp(mvts["Date"].min()).normalize()
+    annees_ecoulees = (pd.Timestamp.now().normalize() - debut).days / 365.25
+
+    with st.spinner("Reconstitution de l'historique…"):
+        historique = charger_cours(tuple(sorted(mvts["Ticker"].unique())),
+                                   periode="5y")
+        indice = charger_cours((INDICES[choix_indice],), periode="5y")
+
+    if historique.empty:
+        st.caption("Historique de cours indisponible.")
+    else:
+        calendrier = historique.index[historique.index >= debut]
+        quantites = pfm.quantites_quotidiennes(mvts, calendrier)
+        # Le change est figé au taux du jour faute d'historique par ligne :
+        # sur un portefeuille majoritairement en dollar, cela déplace les
+        # valeurs passées de quelques pour cent. C'est dit, pas caché.
+        taux_lignes = {t: taux(table.at[t, "Devise"], devise_base)
+                       for t in quantites.columns if t in table.index}
+        serie_valeur = pfm.valeur_quotidienne(quantites, historique, taux_lignes)
+        flux = pfm.flux_externes(mvts, taux_lignes)
+
+        mesures = pfm.twr(serie_valeur, flux)
+        taux_interne = pfm.tri(flux, total, calendrier[-1]) if len(calendrier) else np.nan
+
+        colonne_indice = (indice.columns[0] if not indice.empty else None)
+        contre = pfm.contrefactuel(
+            flux, indice[colonne_indice]) if colonne_indice else {}
+        ecart = pfm.comparaison(total, contre)
+
+        p = st.columns(4)
+        p[0].metric(
+            "Rendement annualisé",
+            f"{mesures['annualise'] * 100:+.1f} %" if mesures.get("annualise")
+            and np.isfinite(mesures["annualise"]) else "—",
+            help="Pondéré par le temps : neutralise les versements et mesure "
+                 "la qualité des choix de titres, indépendamment du moment "
+                 "où l'argent est arrivé.")
+        p[1].metric(
+            "Ce que tu as gagné",
+            f"{taux_interne * 100:+.1f} %" if np.isfinite(taux_interne) else "—",
+            help="Pondéré par les capitaux. Nettement inférieur au précédent, "
+                 "c'est que les renforcements sont tombés aux mauvais "
+                 "moments — un défaut de comportement, pas de sélection.")
+        if contre:
+            p[2].metric(
+                choix_indice.split(" (")[0],
+                f"{contre['valeur']:,.0f} {devise_base}".replace(",", " "),
+                f"{contre['rendement'] * 100:+.1f} %", delta_color="off",
+                help="Valeur qu'auraient atteinte les mêmes versements, aux "
+                     "mêmes dates, placés sur cet indice.")
+            p[3].metric(
+                "Écart", f"{ecart['ecart']:+,.0f} {devise_base}".replace(",", " "),
+                f"{ecart['ecart_pct']:+.1f} %")
+
+        if contre and ecart:
+            if ecart["gagne"]:
+                st.success(
+                    f"Ton portefeuille vaut {ecart['ecart']:,.0f} {devise_base} "
+                    f"de plus que le même argent placé sur l'indice."
+                    .replace(",", " "), icon="✓")
+            else:
+                st.warning(
+                    f"Le même argent placé sur l'indice vaudrait "
+                    f"{abs(ecart['ecart']):,.0f} {devise_base} de plus, sans "
+                    f"aucune décision à prendre ni aucun suivi."
+                    .replace(",", " "), icon="📉")
+
+        if not pfm.fiable(annees_ecoulees):
+            st.info(
+                f"**{annees_ecoulees:.1f} an(s) d'historique.** En dessous de "
+                f"{pfm.DUREE_INTERPRETABLE:.0f} ans, l'écart avec un indice ne "
+                f"se distingue pas du hasard : un portefeuille concentré peut "
+                f"battre ou perdre contre son indice de plusieurs dizaines de "
+                f"points sur une telle durée sans que cela dise quoi que ce "
+                f"soit sur la qualité des décisions. Ces chiffres sont à "
+                f"regarder, pas à conclure.", icon="⏳")
+
+        st.caption(
+            "Les conversions de devise utilisent le taux du jour faute "
+            "d'historique de change par ligne : sur un portefeuille "
+            "majoritairement en dollar, les valeurs passées peuvent être "
+            "décalées de quelques pour cent.")
 
 
 # --- Positions soldées
