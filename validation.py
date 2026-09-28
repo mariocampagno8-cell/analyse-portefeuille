@@ -135,6 +135,19 @@ def controler_prix(ticker: str, prix: float, date, cours: pd.Series,
     bas, haut = float(fenetre.min()), float(fenetre.max())
     moyenne = float(fenetre.mean())
 
+    # Deux references distinctes, et c'est tout l'enjeu du controle.
+    #
+    # L'historique COMPLET dit si le prix est reel : un cours que le titre a
+    # effectivement cote un jour n'est pas une erreur de saisie, meme s'il ne
+    # correspond pas a la date indiquee. Premier essai de ce module : le test
+    # des extremes portait sur la fenetre, et classait donc en bloquant un
+    # prix authentique dont seule la date etait fausse.
+    #
+    # La FENETRE autour de la date dit si la date est coherente. Un prix reel
+    # hors de la fenetre signale une date erronee — defaut serieux, puisqu'il
+    # deplace le prix de revient, mais d'une autre nature.
+    bas_h, haut_h = float(serie.min()), float(serie.max())
+
     # Le critere est l'intervalle reellement parcouru par le titre, pas un
     # nombre d'ecarts-types. Un titre en forte tendance s'ecarte souvent de
     # trois ecarts-types de sa moyenne sans que rien d'anormal ne se produise :
@@ -156,24 +169,35 @@ def controler_prix(ticker: str, prix: float, date, cours: pd.Series,
                     f"probablement été saisi à la place du prix unitaire.")
         return ""
 
-    if prix < bas * MARGE_EXTREME or prix > haut / MARGE_EXTREME:
+    if prix < bas_h * MARGE_EXTREME or prix > haut_h / MARGE_EXTREME:
         rapport = (f"{prix / moyenne:.0f} fois" if prix > moyenne
                    else f"un {moyenne / prix:.0f}e") if moyenne > 0 else "?"
         anomalies.append(_anomalie(
-            "bloquant", ticker, "Prix sans rapport avec l'historique",
-            f"{prix:.2f} saisi alors que {ticker} a coté entre {bas:.2f} et "
-            f"{haut:.2f} autour de cette date, soit {rapport} le cours "
-            f"moyen.{piste_unitaire()}",
+            "bloquant", ticker, "Prix jamais coté par ce titre",
+            f"{prix:.2f} saisi alors que {ticker} n'est jamais sorti de "
+            f"l'intervalle {bas_h:.2f} – {haut_h:.2f} sur tout l'historique "
+            f"disponible, soit {rapport} le cours moyen de la "
+            f"période.{piste_unitaire()}",
             "Vérifie s'il s'agit bien d'un prix unitaire, et dans quelle "
             "unité — certaines places cotent en centièmes."))
     elif prix < plancher or prix > plafond:
+        # Le prix existe dans l'historique : c'est la date qui ne colle pas.
+        # Dire quand ce cours a ete atteint vaut mieux que constater l'ecart.
+        ecart = (serie - prix).abs()
+        proche_date = ecart.idxmin()
+        quand = ""
+        try:
+            quand = (f" Ce cours correspond plutôt au "
+                     f"{pd.Timestamp(proche_date).strftime('%d/%m/%Y')}.")
+        except Exception:
+            pass
         anomalies.append(_anomalie(
-            "serieux", ticker, "Prix jamais atteint à cette période",
-            f"{prix:.2f} saisi alors que {ticker} n'est pas sorti de "
-            f"l'intervalle {bas:.2f} – {haut:.2f} dans les six semaines "
-            f"entourant cette date.{piste_unitaire()}",
-            "Vérifie la date de l'opération : une date erronée déplace le "
-            "prix de revient et fausse les plus-values."))
+            "serieux", ticker, "Date probablement erronée",
+            f"{prix:.2f} est un cours réel de {ticker}, mais le titre n'est "
+            f"pas sorti de l'intervalle {bas:.2f} – {haut:.2f} dans les six "
+            f"semaines entourant la date saisie.{quand}{piste_unitaire()}",
+            "Corrige la date : elle décale le prix de revient et fausse les "
+            "plus-values réalisées."))
 
     return anomalies
 
@@ -219,6 +243,41 @@ def controler_positions(positions: pd.DataFrame, valeurs: pd.Series,
 # Assemblage
 # ==========================================================================
 
+def _regrouper_dates(anomalies: list[dict], mvts: pd.DataFrame) -> list[dict]:
+    """
+    Remplace une serie d'alertes de date par une seule, quand elles partagent
+    la meme date d'operation.
+
+    Une position reprise en bloc porte souvent une date de convention — le
+    premier jour de l'annee, la date de creation de la feuille. Signaler
+    separement chaque ligne noie l'information dans la repetition alors qu'il
+    n'y a qu'une chose a comprendre et une seule correction a faire.
+    """
+    dates_fautives = [a for a in anomalies if a["titre"] == "Date probablement erronée"]
+    if len(dates_fautives) < 3 or mvts is None or mvts.empty:
+        return anomalies
+
+    concernes = {a["ticker"] for a in dates_fautives}
+    lignes = mvts[mvts["Ticker"].isin(concernes)]
+    dates = pd.to_datetime(lignes["Date"]).dt.normalize().unique()
+    if len(dates) != 1:
+        return anomalies
+
+    jour = pd.Timestamp(dates[0]).strftime("%d/%m/%Y")
+    autres = [a for a in anomalies if a["titre"] != "Date probablement erronée"]
+    autres.append(_anomalie(
+        "serieux", "—", f"{len(dates_fautives)} opérations datées du {jour}",
+        f"Les prix saisis pour {', '.join(sorted(concernes))} ne correspondent "
+        f"pas aux cours de cette date, mais à des cours réels d'autres "
+        f"périodes. Tout indique une reprise de positions à une date de "
+        f"convention plutôt que les dates d'achat effectives.",
+        "Sans conséquence sur les quantités ni sur le prix de revient moyen, "
+        "qui ne dépendent pas des dates. En revanche les plus-values seront "
+        "mal datées, et la durée de détention inexacte. Corrige les dates si "
+        "tu veux un suivi fiscal juste."))
+    return autres
+
+
 def controler(mvts: pd.DataFrame, positions: pd.DataFrame,
               valeurs: pd.Series, cours: pd.DataFrame,
               devises_reelles: dict) -> pd.DataFrame:
@@ -246,6 +305,7 @@ def controler(mvts: pd.DataFrame, positions: pd.DataFrame,
                                         float(m["Quantité"]))
 
     anomalies += controler_positions(positions, valeurs, connus)
+    anomalies = _regrouper_dates(anomalies, mvts)
 
     if not anomalies:
         return pd.DataFrame(columns=["gravite", "rang", "ticker", "titre",
