@@ -36,14 +36,16 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+import reglages as rg
+
 # Plafond de perte acceptee sur une seule idee, en % du portefeuille.
-RISQUE_DEFAUT = 1.0
+RISQUE_DEFAUT = rg.RISQUE_PAR_IDEE
 RISQUE_MAX = 3.0
 
 # Plafond de taille, independamment du stop : une ligne peut avoir un stop
 # tres serre et rester deraisonnable en taille, notamment parce qu'un stop
 # ne protege pas d'une ouverture en decalage.
-PLAFOND_LIGNE = 20.0
+PLAFOND_LIGNE = rg.PLAFOND_LIGNE
 
 FRACTION_KELLY = 0.25
 

@@ -38,31 +38,27 @@ import analyse as ia
 import dimension as dm
 import mouvements as mo
 import niveaux as nvx
+import reglages as rg
 import validation as val
 
-ONGLET_MOUVEMENTS = "MOUVEMENTS"
+ONGLET_MOUVEMENTS = rg.ONGLET_MOUVEMENTS
 
 ETAT = Path(__file__).parent / "derniere_visite.json"
 
-# Seuils calibrés en écarts-types plutôt qu'en pourcentage fixe : 5 % est un
-# événement sur Coca-Cola et une séance ordinaire sur une valeur volatile.
-SIGMA_MOUVEMENT = 2.5
-PLANCHER_MOUVEMENT = 3.0
-PLAFOND_MOUVEMENT = 12.0
-PROXIMITE_SEUIL = 3.0            # % — approche d'un seuil
-CONCENTRATION = 25.0             # % — poids maximal d'une ligne
+# Les seuils sont dans reglages.py, partagé avec la veille Telegram : deux
+# programmes qui regardent le même portefeuille doivent dire la même chose.
+SIGMA_MOUVEMENT = rg.SIGMA_MOUVEMENT
+PLANCHER_MOUVEMENT = rg.PLANCHER_MOUVEMENT
+PLAFOND_MOUVEMENT = rg.PLAFOND_MOUVEMENT
+PROXIMITE_SEUIL = rg.PROXIMITE_SEUIL
+CONCENTRATION = rg.CONCENTRATION
 
-# Seuils de vente et d'achat calculés par l'application quand la feuille ne
-# les renseigne pas. Le stop est suiveur : il s'accroche au plus haut récent
-# et s'en écarte d'un multiple de la volatilité du titre sur un mois de
-# bourse, de sorte qu'une valeur calme se déclenche tôt et une valeur agitée
-# ne se déclenche pas sur son bruit ordinaire.
-HORIZON_STOP = 20                # séances — un mois de bourse
-STOP_SIGMA = 2.0                 # écarts-types
-STOP_MIN = 8.0                   # % — plancher
-STOP_MAX = 30.0                  # % — plafond
-FENETRE_HAUT = 120               # séances — plus haut de référence
-FENETRE_MOYENNE = 50             # séances — moyenne de référence pour l'achat
+HORIZON_STOP = rg.HORIZON_STOP
+STOP_SIGMA = rg.STOP_SIGMA
+STOP_MIN = rg.STOP_MIN
+STOP_MAX = rg.STOP_MAX
+FENETRE_HAUT = rg.FENETRE_HAUT
+FENETRE_MOYENNE = rg.FENETRE_MOYENNE
 
 
 st.set_page_config(page_title="FinexResearch", page_icon="◪", layout="wide")

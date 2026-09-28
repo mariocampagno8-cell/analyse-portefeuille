@@ -34,23 +34,29 @@ import requests
 import yfinance as yf
 
 import cycle as cy
+import google_prive as gpv
+import mouvements as mo
 import officiel as of
+import reglages as rg
 import resultats as rs
+import secrets_env as se
 
 
 # ==========================================================================
 # 1. RÉGLAGES
 # ==========================================================================
 
-# Le mouvement de séance est calibré en écarts-types, jamais en pourcentage
-# fixe : 5 % est un événement sur Coca-Cola et une séance ordinaire sur IONQ.
-SIGMA = 2.5
-PLANCHER = 3.0                  # jamais d'alerte en deçà
-PLAFOND = 12.0                  # toujours une alerte au-delà
+# Les seuils viennent de reglages.py, partagé avec l'application Streamlit.
+# Tant que chacun portait les siens, les deux outils divergeaient en silence :
+# la veille alertait sur une concentration à 15 % là où l'application la
+# tolérait jusqu'à 25.
+SIGMA = rg.SIGMA_MOUVEMENT
+PLANCHER = rg.PLANCHER_MOUVEMENT     # jamais d'alerte en deçà
+PLAFOND = rg.PLAFOND_MOUVEMENT       # toujours une alerte au-delà
 
-PROXIMITE_ENTREE = 3.0          # % — approche du prix d'entrée (strate B)
-PROXIMITE_CIBLE = 10.0          # % — approche du prix cible (strate C)
-CONCENTRATION = 15.0            # % du portefeuille sur une seule ligne
+PROXIMITE_ENTREE = rg.PROXIMITE_SEUIL    # % — approche du prix d'entrée
+PROXIMITE_CIBLE = rg.PROXIMITE_CIBLE     # % — approche du prix cible
+CONCENTRATION = rg.CONCENTRATION         # % du portefeuille sur une ligne
 CONCURRENT = 5.0                # % — mouvement chez un pair
 
 MAX_SONORES = 4                 # push sonores par jour
@@ -135,6 +141,61 @@ def url_csv(url: str) -> list[str]:
             f"{racine}/gviz/tq?tqx=out:csv"]
 
 
+def _lire_onglet(url: str, onglet: str) -> pd.DataFrame:
+    """
+    Charge un onglet, par compte de service si le secret est present.
+
+    La lecture publique subsiste en secours, mais elle est signalee : elle
+    suppose la feuille publiee sur le web, donc lisible par quiconque connait
+    son adresse — et cette adresse circule en clair dans les journaux
+    d'execution de GitHub Actions.
+    """
+    if se.compte_configure():
+        return gpv.lire(se.contexte(), url, onglet=onglet)
+
+    print("ATTENTION : lecture publique. Ajoute le secret GCP_SERVICE_ACCOUNT "
+          "pour passer en acces authentifie et couper la publication web.")
+    for adresse in url_csv(url):
+        try:
+            essai = pd.read_csv(adresse)
+            if not essai.empty:
+                return essai
+        except Exception:
+            continue
+    raise ValueError(
+        "Feuille inaccessible. Renseigne le secret GCP_SERVICE_ACCOUNT, ou "
+        "verifie que la feuille est publiee au format CSV.")
+
+
+def _positions_du_journal(url: str) -> pd.DataFrame:
+    """
+    Quantites et prix de revient deduits de l'onglet MOUVEMENTS.
+
+    Le journal fait foi : une quantite reconstituee a partir d'operations
+    datees vaut mieux qu'une quantite ressaisie a la main, et c'est ce que
+    fait l'application. La veille lisait encore les colonnes figees du premier
+    onglet, ce qui suffisait a ce que les deux outils annoncent des positions
+    differentes. Son absence n'est pas une erreur : une feuille sans journal
+    reste exploitable par les colonnes de l'onglet PORTEFEUILLE.
+    """
+    try:
+        brut = _lire_onglet(url, rg.ONGLET_MOUVEMENTS)
+    except Exception as erreur:
+        print(f"Onglet {rg.ONGLET_MOUVEMENTS} absent ou illisible "
+              f"({type(erreur).__name__}) : positions lues dans l'onglet "
+              f"{rg.ONGLET_PORTEFEUILLE}.")
+        return pd.DataFrame()
+
+    journal = mo.lire(brut)
+    if journal.empty:
+        return pd.DataFrame()
+    etat, anomalies = mo.derouler(journal)
+    for a in anomalies[:10]:
+        print(f"  journal : {a}")
+    print(f"Journal : {len(journal)} operation(s), {len(etat)} ligne(s).")
+    return etat
+
+
 def lire_univers(url: str) -> pd.DataFrame:
     """
     Charge l'univers depuis la feuille et applique les règles de strate.
@@ -144,18 +205,7 @@ def lire_univers(url: str) -> pd.DataFrame:
     déclarée B sans prix d'entrée redescend en C : c'est le filtre dur qui
     empêche la strate B de devenir un fourre-tout.
     """
-    brut = None
-    for adresse in url_csv(url):
-        try:
-            essai = pd.read_csv(adresse)
-            if not essai.empty:
-                brut = essai
-                break
-        except Exception:
-            continue
-    if brut is None:
-        raise ValueError("Feuille inaccessible. Vérifie qu'elle est publiée "
-                         "au format CSV.")
+    brut = _lire_onglet(url, rg.ONGLET_PORTEFEUILLE)
 
     correspondance = {}
     for colonne in brut.columns:
@@ -179,12 +229,27 @@ def lire_univers(url: str) -> pd.DataFrame:
         raise ValueError(f"Colonne Ticker introuvable. Colonnes trouvées : "
                          f"{', '.join(map(str, brut.columns))}.")
 
+    # Le journal, s'il existe, remplace les quantites et prix de revient
+    # figes de l'onglet PORTEFEUILLE. Les tickers qu'il contient et que la
+    # feuille ignore sont ajoutes : une position detenue ne doit pas echapper
+    # a la surveillance parce qu'on a oublie de la lister.
+    journal = _positions_du_journal(url)
+    if not journal.empty:
+        connus = {str(t).strip().upper() for t in brut.get("ticker", [])}
+        manquants = [t for t in journal.index if t not in connus]
+        if manquants:
+            print(f"Ajout depuis le journal : {', '.join(manquants)}")
+            brut = pd.concat([brut, pd.DataFrame({"ticker": manquants})],
+                             ignore_index=True)
+
     lignes, reclassements = [], []
     for _, ligne in brut.iterrows():
         ticker = str(ligne.get("ticker", "")).strip().upper()
         if not ticker or ticker in ("NAN", "TICKER"):
             continue
         quantite = _nombre(ligne.get("quantite"))
+        if not journal.empty and ticker in journal.index:
+            quantite = float(journal.at[ticker, "Quantité"])
         entree = _nombre(ligne.get("prix_entree"))
         strate = str(ligne.get("strate", "C")).strip().upper()[:1]
         if strate not in ("A", "B", "C"):
@@ -199,7 +264,10 @@ def lire_univers(url: str) -> pd.DataFrame:
 
         lignes.append({
             "ticker": ticker, "strate": strate, "quantite": quantite,
-            "pru": _nombre(ligne.get("pru")), "prix_entree": entree,
+            "pru": (float(journal.at[ticker, "PRU"])
+                    if not journal.empty and ticker in journal.index
+                    else _nombre(ligne.get("pru"))),
+            "prix_entree": entree,
             "prix_sortie": _nombre(ligne.get("prix_sortie")),
             "concurrents": str(ligne.get("concurrents", "") or "").strip(),
             "note": str(ligne.get("note", "") or "").strip()})
@@ -481,49 +549,6 @@ def alertes_cycle(univers: pd.DataFrame, cours: pd.DataFrame,
     return alertes
 
 
-def alertes_officielles(univers: pd.DataFrame) -> list[dict]:
-    """
-    Depots SEC recents, classes par code d'item.
-
-    C'est la seule source du systeme dont la latence se compte en minutes.
-    Les valeurs europeennes n'y figurent pas : EDGAR ne couvre que les
-    emetteurs americains.
-    """
-    strates = dict(zip(univers["ticker"], univers["strate"]))
-    alertes = []
-    americaines = [t for t in univers["ticker"] if cy.est_americaine(t)]
-    if not americaines:
-        return alertes
-
-    print(f"{len(americaines)} valeur(s) couverte(s) par EDGAR "
-          f"sur {len(univers)}.")
-
-    for ticker in americaines:
-        strate = strates.get(ticker, "C")
-        for depot in of.depots(ticker, jours=1):
-            # Strate C : uniquement l'exceptionnel
-            if strate == "C" and depot["priorite"] != "P1":
-                continue
-            if depot["priorite"] == "P3":
-                continue
-
-            if depot["formulaire"] == "8-K" and depot["item"] == "2.02":
-                message = cy.message_publication_immediate(
-                    depot, strate, rs.consensus(ticker))
-                nature = "resultats_publies"
-            else:
-                message = cy.message_communique(depot, strate)
-                nature = f"depot_{depot['item'] or depot['formulaire']}"
-
-            alertes.append({
-                "ticker": ticker, "strate": strate,
-                "priorite": depot["priorite"],
-                "sonore": depot["priorite"] == "P1" and strate in ("A", "B"),
-                "nature": nature, "emoji": "📊",
-                "titre": depot["libelle"], "message": message})
-    return alertes
-
-
 def alertes_resultats_enrichis(univers: pd.DataFrame) -> list[dict]:
     """
     Message du lendemain : chiffres publies, verdict de these, lecture.
@@ -609,7 +634,7 @@ def _exception_silence(alerte: dict) -> bool:
         return True
     maintenant = datetime.now().time()
     dans_fenetre = FENETRE_PUBLICATIONS[0] <= maintenant <= FENETRE_PUBLICATIONS[1]
-    return (dans_fenetre and alerte["nature"] == "resultats_publies"
+    return (dans_fenetre and alerte["nature"] == "chiffres_enrichis"
             and alerte["strate"] in ("A", "B"))
 
 
@@ -820,21 +845,20 @@ def principal() -> int:
     alertes = detecter(univers, cours, publications, mode)
     print(f"{len(alertes)} alerte(s) de prix.")
 
+    # --- Résultats publiés : détectés via le calendrier Yahoo, avec un à
+    #     trois jours de retard sur la publication effective.
+    if mode in ("matin", "soir"):
+        enrichis = alertes_resultats_enrichis(univers)
+        if enrichis:
+            print(f"{len(enrichis)} publication(s) de résultats.")
+            alertes += enrichis
+
     # --- Cycle de résultats et macro, le matin
     if mode == "matin":
         cycle = alertes_cycle(univers, cours, publications)
         macro = alertes_macro()
-        enrichis = alertes_resultats_enrichis(univers)
-        print(f"{len(cycle)} message(s) de cycle, {len(macro)} macro, "
-              f"{len(enrichis)} chiffres enrichis.")
-        alertes += cycle + macro + enrichis
-
-    # --- Dépôts officiels, à chaque passage : c'est la seule source dont la
-    #     latence se compte en minutes, elle ne doit pas attendre le matin.
-    if mode in ("seance", "soir", "matin"):
-        officielles = alertes_officielles(univers)
-        print(f"{len(officielles)} dépôt(s) officiel(s).")
-        alertes += officielles
+        print(f"{len(cycle)} message(s) de cycle, {len(macro)} macro.")
+        alertes += cycle + macro
 
     print(f"{len(alertes)} alerte(s) au total.")
 

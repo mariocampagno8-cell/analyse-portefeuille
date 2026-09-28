@@ -32,6 +32,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+import reglages as rg
+
 # Devises cotees en centiemes. La conversion n'est pas une question de taux
 # mais d'unite : 453 GBp valent 4,53 GBP, pas 453.
 CENTIEMES = {"GBP": "GBp", "ZAR": "ZAc", "ILS": "ILA"}
@@ -39,7 +41,7 @@ CENTIEMES = {"GBP": "GBp", "ZAR": "ZAc", "ILS": "ILA"}
 # Seuils des controles
 ECARTS_PRIX = 3.0            # ecarts-types toleres sur un prix de saisie
 MARGE_EXTREME = 0.5          # prix hors de [0,5 x plus bas ; 2 x plus haut]
-CONCENTRATION_ALERTE = 25.0  # % du portefeuille sur une ligne
+CONCENTRATION_ALERTE = rg.CONCENTRATION  # % du portefeuille sur une ligne
 
 GRAVITE = {"bloquant": 0, "serieux": 1, "informatif": 2}
 
