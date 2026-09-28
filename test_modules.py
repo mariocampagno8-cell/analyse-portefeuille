@@ -226,6 +226,57 @@ def test_objectif_est_un_multiple_du_risque():
                       nv.HORIZONS[r["Horizon"]]["gain"] * r["Risque (%)"], 1e-9)
 
 
+def test_stop_capital_calcule_sur_le_prix_de_revient():
+    """PRU 100 et 15 % de perte acceptée : le stop de capital vaut 85."""
+    d = bougies(0.012, 70, 0.0007)
+    t = nv.niveaux(d, pru=100.0, perte_capital=15.0)
+    for _, r in t.iterrows():
+        assert proche(r["Stop capital"], 85.0, 1e-9)
+
+
+def test_seuil_retenu_est_le_plus_haut_des_deux():
+    """À la baisse, c'est le seuil le plus haut qui est touché en premier."""
+    d = bougies(0.012, 70, 0.0007)
+    t = nv.niveaux(d, pru=140.0, perte_capital=15.0)
+    for _, r in t.iterrows():
+        assert proche(r["Stop"], max(r["Stop marché"], r["Stop capital"]), 1e-9)
+        attendue = ("capital" if r["Stop capital"] > r["Stop marché"]
+                    else "marché")
+        assert r["Origine"] == attendue
+
+
+def test_sans_prix_de_revient_seul_le_stop_de_marche_existe():
+    t = nv.niveaux(bougies(0.012, 70, 0.0007))
+    for _, r in t.iterrows():
+        assert np.isnan(r["Stop capital"])
+        assert r["Origine"] == "marché"
+        assert proche(r["Stop"], r["Stop marché"], 1e-12)
+        assert np.isnan(r["Résultat au stop (%)"])
+
+
+def test_resultat_au_stop_rapporte_au_prix_de_revient():
+    """Quand le stop de capital l'emporte, la perte vaut exactement le budget."""
+    d = bougies(0.012, 70, 0.0007)
+    t = nv.niveaux(d, pru=200.0, perte_capital=15.0)
+    capitaux = t[t["Origine"] == "capital"]
+    assert len(capitaux) == 3          # PRU très au-dessus : le capital mord
+    for _, r in capitaux.iterrows():
+        assert proche(r["Résultat au stop (%)"], -15.0, 1e-9)
+
+
+def test_marge_et_resultat_au_stop_ont_des_references_differentes():
+    """L'une se rapporte au cours, l'autre au prix de revient."""
+    d = bougies(0.012, 70, 0.0007)
+    actuel = float(d["Close"].iloc[-1])
+    pru = actuel * 0.60                 # acheté bien plus bas
+    t = nv.niveaux(d, pru=pru, perte_capital=15.0)
+    r = t.iloc[0]
+    assert proche(r["Marge (%)"], (1 - r["Stop"] / actuel) * 100, 1e-9)
+    assert proche(r["Résultat au stop (%)"], (r["Stop"] / pru - 1) * 100, 1e-9)
+    # Une ligne largement gagnante : le stop reste au-dessus du prix payé
+    assert r["Résultat au stop (%)"] > 0
+
+
 def test_historique_trop_court_ne_produit_rien():
     assert nv.niveaux(pd.DataFrame()).empty
     assert nv.niveaux(pd.DataFrame({"High": [1, 2], "Low": [1, 2],

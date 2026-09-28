@@ -613,6 +613,13 @@ with onglets_niveaux[0]:
             charger_ohlc.clear()
             charger_cours.clear()
             st.rerun()
+
+    perte_capital = st.slider(
+        "Perte maximale acceptée sur une position (% du prix de revient)",
+        5.0, 40.0, nvx.PERTE_CAPITAL, 2.5, key="perte_capital",
+        help="Second stop, calculé sur ce que tu as payé et non sur le "
+             "marché. À la baisse, c'est le plus haut des deux qui se "
+             "déclenche en premier ; la colonne Origine dit lequel.")
     recap = []
     with st.spinner("Calcul des niveaux…"):
         for t in detenues.index:
@@ -621,7 +628,7 @@ with onglets_niveaux[0]:
                 continue
             pru_t = (float(detenues.at[t, "PRU"])
                      if np.isfinite(detenues.at[t, "PRU"]) else np.nan)
-            s = nvx.synthese(ohlc, horizon, pru_t)
+            s = nvx.synthese(ohlc, horizon, pru_t, perte_capital)
             if not s:
                 continue
 
@@ -642,13 +649,16 @@ with onglets_niveaux[0]:
                 "Poids (%)": part,
                 "Cours": float(detenues.at[t, "Cours"]),
                 "Stop": s["Stop"],
+                "Origine": s["Origine"],
                 "Marge (%)": marge,
+                "Au stop (%)": s["Résultat au stop (%)"],
                 f"Coût ({devise_base})": cout,
                 "Coût / ptf (%)": (np.nan if franchi
                                    else cout / total * 100 if total > 0
                                    else np.nan),
                 "Objectif": s["Objectif"],
                 "Potentiel (%)": s["Potentiel (%)"],
+                "À l'objectif (%)": s["Gain à l'objectif (%)"],
                 "_franchi": franchi})
 
     if not recap:
@@ -704,8 +714,22 @@ with onglets_niveaux[0]:
                     format="%.2f %%",
                     help="La même perte, rapportée au portefeuille entier. "
                          "C'est le chiffre qui hiérarchise les lignes."),
+                "Au stop (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%",
+                    help="Plus ou moins-value si ce stop se déclenchait, "
+                         "rapportée à ton prix de revient. Vide si la ligne "
+                         "n'a pas de prix de revient connu."),
+                "Origine": st.column_config.TextColumn(
+                    width="small",
+                    help="« marché » : c'est la volatilité du titre qui fixe "
+                         "le seuil. « capital » : c'est ta perte maximale "
+                         "acceptée qui l'emporte."),
                 "Potentiel (%)": st.column_config.NumberColumn(
                     format="%+.1f %%"),
+                "À l'objectif (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%",
+                    help="Gain rapporté à ton prix de revient si l'objectif "
+                         "était atteint."),
             })
 
         if len(casse):
@@ -744,7 +768,9 @@ with onglets_niveaux[1]:
     else:
         pru_n = (float(detenues.at[choix_n, "PRU"])
                  if np.isfinite(detenues.at[choix_n, "PRU"]) else np.nan)
-        detail = nvx.niveaux(ohlc, pru_n)
+        detail = nvx.niveaux(ohlc, pru_n,
+                             st.session_state.get('perte_capital',
+                                                  nvx.PERTE_CAPITAL))
         actuel_n = float(ohlc["Close"].iloc[-1])
         st.caption(f"Cours {actuel_n:.2f} · amplitude moyenne d'une séance "
                    f"{nvx.volatilite_relative(ohlc):.2f} %"
@@ -775,6 +801,17 @@ with onglets_niveaux[1]:
                         f"Risque {r['Risque (%)']:.1f} % pour un gain visé de "
                         f"{r['Gain visé (%)']:.1f} % · résistance récente "
                         f"{r['Résistance']:.2f}, support {r['Support']:.2f}")
+                    detail_stops = (
+                        f"Stop de marché {r['Stop marché']:.2f}"
+                        + (f" · stop de capital {r['Stop capital']:.2f}"
+                           if np.isfinite(r["Stop capital"]) else "")
+                        + f" — c'est le seuil de **{r['Origine']}** qui "
+                          f"s'applique")
+                    if np.isfinite(r["Résultat au stop (%)"]):
+                        detail_stops += (
+                            f", soit {r['Résultat au stop (%)']:+.1f} % sur "
+                            f"ton prix de revient")
+                    droite.caption(detail_stops)
                 if r["Sous le PRU"] is True:
                     gauche.caption("⚠️ ce stop est sous ton prix de revient : "
                                    "il entérinerait une perte.")

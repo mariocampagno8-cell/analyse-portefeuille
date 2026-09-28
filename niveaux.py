@@ -31,6 +31,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+import reglages as rg
+
 # Fenetre d'observation, multiple d'ATR pour le stop, multiple de risque pour
 # l'objectif. Le multiple d'ATR croit avec l'horizon : un stop de long terme
 # doit survivre a des corrections qui n'ont pas de sens a court terme.
@@ -44,6 +46,9 @@ HORIZONS = {
 }
 
 PERIODE_ATR = 14
+
+# Perte maximale acceptee sur une position, en % du prix de revient.
+PERTE_CAPITAL = rg.PERTE_CAPITAL
 
 
 def atr(haut: pd.Series, bas: pd.Series, cloture: pd.Series,
@@ -84,20 +89,39 @@ def _dernier(serie: pd.Series) -> float:
     return float(valeurs.iloc[-1]) if len(valeurs) else np.nan
 
 
-def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
+def niveaux(ohlc: pd.DataFrame, pru: float = np.nan,
+            perte_capital: float = PERTE_CAPITAL) -> pd.DataFrame:
     """
-    Trois horizons, un stop et un objectif chacun.
+    Trois horizons, deux familles de seuils, un tableau.
 
-    `ohlc` porte les colonnes High, Low, Close. `pru` sert uniquement a dire
-    si le stop protege encore un gain ou entérine déjà une perte.
+    Le stop de marche vient du titre : plus haut de la periode moins un
+    multiple de l'ATR. Il ignore ce que vous avez paye, et c'est voulu — le
+    cours l'ignore aussi. C'est la seule facon de dimensionner la tolerance
+    au bruit d'un titre.
+
+    Le stop de capital vient de vous : le prix de revient diminue de la perte
+    maximale que vous acceptez sur une position. Ce n'est pas une lecture du
+    marche mais une regle de gestion, et elle a sa place a cote de l'autre.
+
+    Le seuil retenu est le PLUS HAUT des deux, parce qu'a la baisse c'est
+    celui-la qui se declenche en premier. La colonne Origine dit lequel mord,
+    ce qui evite de croire a une lecture technique la ou c'est une regle
+    personnelle qui a tranche, et inversement.
+
+    Les deux dernieres colonnes rapportent tout au prix de revient : ce que
+    le stop ferait perdre, ce que l'objectif ferait gagner. Les pourcentages
+    de marge et de potentiel, eux, restent rapportes au cours — deux
+    references differentes pour deux questions differentes.
     """
     # Convention de signe, valable dans tout le module : une marge positive
     # est une baisse encore encaissable avant de toucher le stop, une marge
     # negative signifie que le cours est deja passe dessous. Le signe se lit
     # donc comme une sante : positif bon, negatif mauvais.
-    colonnes = ["Horizon", "Stop", "Marge (%)", "Objectif",
-                "Potentiel (%)", "Risque (%)", "Gain visé (%)",
-                "Résistance", "Support", "Franchi", "Sous le PRU"]
+    colonnes = ["Horizon", "Stop", "Origine", "Marge (%)",
+                "Résultat au stop (%)", "Objectif", "Potentiel (%)",
+                "Gain à l'objectif (%)", "Stop marché", "Stop capital",
+                "Risque (%)", "Gain visé (%)", "Résistance", "Support",
+                "Franchi", "Sous le PRU"]
     if ohlc is None or ohlc.empty or len(ohlc) < 40:
         return pd.DataFrame(columns=colonnes)
 
@@ -120,7 +144,20 @@ def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
         # connu ; en tendance haussiere ce creux se situe juste sous le cours
         # et ecrasait les trois horizons a la meme valeur. Le creux reste
         # affiche a titre indicatif, il ne contraint plus le calcul.
-        stop = plus_haut - p["atr"] * a
+        stop_marche = plus_haut - p["atr"] * a
+
+        # Stop de capital : le prix de revient ampute de la perte acceptee.
+        # Sans prix de revient connu — une valeur simplement surveillee — il
+        # n'existe pas, et seul le stop de marche s'applique.
+        pru_connu = np.isfinite(pru) and pru > 0
+        stop_capital = pru * (1 - perte_capital / 100) if pru_connu else np.nan
+
+        # A la baisse, le premier seuil touche est le plus haut des deux.
+        if pru_connu:
+            stop = max(stop_marche, stop_capital)
+            origine = "marché" if stop_marche >= stop_capital else "capital"
+        else:
+            stop, origine = stop_marche, "marché"
 
         # Un stop au-dessus du cours signifie que le titre a deja perdu plus
         # que sa tolerance au bruit depuis son plus haut : le seuil est
@@ -136,10 +173,19 @@ def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
         lignes.append({
             "Horizon": nom,
             "Stop": stop,
+            "Origine": origine,
             "Marge (%)": (1 - stop / actuel) * 100,
+            # Rapporte au prix de revient : ce que la sortie laisserait
+            # reellement, positif comme negatif.
+            "Résultat au stop (%)": ((stop / pru - 1) * 100
+                                     if pru_connu else np.nan),
             "Objectif": objectif,
             "Potentiel (%)": (np.nan if franchi
                               else (objectif / actuel - 1) * 100),
+            "Gain à l'objectif (%)": ((objectif / pru - 1) * 100
+                                      if pru_connu and not franchi else np.nan),
+            "Stop marché": stop_marche,
+            "Stop capital": stop_capital,
             "Risque (%)": risque,
             "Gain visé (%)": np.nan if franchi else p["gain"] * risque,
             "Résistance": plus_haut,
@@ -152,9 +198,10 @@ def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
 
 
 def synthese(ohlc: pd.DataFrame, horizon: str = "Moyen terme",
-             pru: float = np.nan) -> dict:
+             pru: float = np.nan,
+             perte_capital: float = PERTE_CAPITAL) -> dict:
     """Les chiffres d'un seul horizon, pour un tableau recapitulatif."""
-    table = niveaux(ohlc, pru)
+    table = niveaux(ohlc, pru, perte_capital)
     if table.empty:
         return {}
     ligne = table[table["Horizon"] == horizon]

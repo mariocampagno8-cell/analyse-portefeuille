@@ -33,6 +33,13 @@ STOP_MAX = 30.0                  # % — plafond
 FENETRE_HAUT = 120               # seances — plus haut de reference
 FENETRE_MOYENNE = 50             # seances — moyenne de reference
 
+# --- Seuils rapportes au prix de revient
+# Perte maximale acceptee sur une position, en % du prix paye. C'est une
+# regle de gestion, pas une lecture du marche : le cours ignore ce que vous
+# avez paye. Elle sert de second stop, et c'est le plus haut des deux qui se
+# declenche en premier a la baisse.
+PERTE_CAPITAL = 15.0
+
 # --- Dimensionnement
 RISQUE_PAR_IDEE = 1.0            # % du portefeuille perdu si le stop tombe
 PLAFOND_LIGNE = 20.0             # % du portefeuille sur une ligne
