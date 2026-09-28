@@ -37,6 +37,7 @@ import google_prive as gpv
 import analyse as ia
 import mouvements as mo
 import niveaux as nvx
+import validation as val
 
 ONGLET_MOUVEMENTS = "MOUVEMENTS"
 
@@ -307,6 +308,11 @@ def seuil_titre(prix: pd.Series) -> float:
                                PLANCHER_MOUVEMENT, PLAFOND_MOUVEMENT)))
 
 
+def facteur_centieme(devise) -> float:
+    """100 si la place cote en centiemes (pence, cents sud-africains…), 1 sinon."""
+    return 100.0 if str(devise or "") in val.CENTIEMES.values() else 1.0
+
+
 def _fini(x) -> bool:
     """Un nombre exploitable, strictement positif."""
     try:
@@ -536,12 +542,25 @@ for _, ligne in univers.iterrows():
     if t not in cours.columns or cours[t].dropna().empty:
         continue
     serie = cours[t].dropna()
-    cours_actuel = float(serie.iloc[-1])
-    veille = float(serie.iloc[-2]) if len(serie) > 1 else cours_actuel
     # La devise saisie l'emporte sur celle que devine Yahoo, qui se trompe
     # regulierement sur les petites capitalisations europeennes.
     devise_ligne = (ligne.get("Devise saisie")
                     or monnaies.get(t, devise_base))
+
+    # Certaines places cotent en centiemes : Londres en pence (GBp),
+    # Johannesburg en cents (ZAc), Tel-Aviv en agorot (ILA). Toute la serie
+    # arrive dans cette unite, seuils compris — la division doit donc se faire
+    # avant tout usage, sans quoi le stop serait en pence et le cours en
+    # livres. GBp n'etant pas un code de devise, la conversion de change
+    # echouerait de toute facon et renverrait 1.
+    diviseur = facteur_centieme(monnaies.get(t))
+    if diviseur > 1:
+        devise_ligne = next(k for k, c in val.CENTIEMES.items()
+                            if c == monnaies.get(t))
+        serie = serie / diviseur
+
+    cours_actuel = float(serie.iloc[-1])
+    veille = float(serie.iloc[-2]) if len(serie) > 1 else cours_actuel
     change = taux(devise_ligne, devise_base)
     quantite = ligne["Quantité"] if np.isfinite(ligne["Quantité"]) else 0.0
     bornes = seuils_retenus(ligne, serie)
@@ -618,13 +637,43 @@ if len(rdt) > 60:
     m[3].metric("Volatilité",
                 f"{an.volatilite(an.rendements_portefeuille(rdt, poids.reindex(rdt.columns).fillna(0))) * 100:.1f} %")
 
+# --- Contrôle des données
+# Le moteur de calcul est testé ; ce qui reste faux vient de la saisie, et ne
+# provoque aucune erreur visible. Ces contrôles sont donc la seule barrière.
+saisies = univers.set_index("Ticker")["Devise saisie"] \
+    if "Devise saisie" in univers.columns else pd.Series(dtype=object)
+controles = val.controler(
+    mvts, pd.DataFrame({"Devise": saisies.reindex(table.index)}),
+    detenues["Valeur"], cours, monnaies)
+bloquants = controles[controles["gravite"] == "bloquant"] if not controles.empty \
+    else controles
+
+if not bloquants.empty:
+    st.error(
+        f"**{len(bloquants)} donnée(s) à corriger avant de se fier aux "
+        f"chiffres.** Une devise ou un prix erroné ne provoque aucune erreur "
+        f"visible : il déplace silencieusement une valeur, un poids et les "
+        f"seuils qui en découlent.", icon="🛑")
+    for _, a in bloquants.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**{a['ticker']} — {a['titre']}**")
+            st.caption(a["detail"])
+            if a["correction"]:
+                st.caption(f"→ {a['correction']}")
+
+autres = controles[controles["gravite"] != "bloquant"] if not controles.empty \
+    else controles
+
 doublons_journal = mo.doublons(mvts)
 rejets = mvts.attrs.get("rejets", [])
 a_verifier = (len(divergences) + len(anomalies_journal)
-              + len(doublons_journal) + len(rejets))
+              + len(doublons_journal) + len(rejets) + len(autres))
 
 if a_verifier:
     with st.expander(f"⚠️ {a_verifier} point(s) à vérifier dans ta feuille"):
+        for _, a in autres.iterrows():
+            st.markdown(f"- **{a['ticker']} — {a['titre']}** {a['detail']}"
+                        + (f" → {a['correction']}" if a["correction"] else ""))
         for d in divergences:
             st.markdown(f"- **Divergence** — {d} Le journal a été retenu.")
         for a in anomalies_journal:
@@ -692,7 +741,7 @@ with onglets_niveaux[0]:
     recap = []
     with st.spinner("Calcul des niveaux…"):
         for t in detenues.index:
-            ohlc = charger_ohlc(t)
+            ohlc = charger_ohlc(t) / facteur_centieme(monnaies.get(t))
             if ohlc.empty:
                 continue
             pru_t = (float(detenues.at[t, "PRU"])
@@ -814,7 +863,7 @@ with onglets_niveaux[0]:
 
 with onglets_niveaux[1]:
     choix_n = st.selectbox("Valeur", list(detenues.index), key="niveaux_ticker")
-    ohlc = charger_ohlc(choix_n)
+    ohlc = charger_ohlc(choix_n) / facteur_centieme(monnaies.get(choix_n))
     if ohlc.empty:
         st.caption("Cours indisponibles pour cette valeur.")
     else:
