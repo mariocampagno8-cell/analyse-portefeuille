@@ -91,8 +91,12 @@ def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
     `ohlc` porte les colonnes High, Low, Close. `pru` sert uniquement a dire
     si le stop protege encore un gain ou entérine déjà une perte.
     """
-    colonnes = ["Horizon", "Stop", "Distance stop (%)", "Objectif",
-                "Distance objectif (%)", "Risque (%)", "Gain visé (%)",
+    # Convention de signe, valable dans tout le module : une marge positive
+    # est une baisse encore encaissable avant de toucher le stop, une marge
+    # negative signifie que le cours est deja passe dessous. Le signe se lit
+    # donc comme une sante : positif bon, negatif mauvais.
+    colonnes = ["Horizon", "Stop", "Marge (%)", "Objectif",
+                "Potentiel (%)", "Risque (%)", "Gain visé (%)",
                 "Résistance", "Support", "Franchi", "Sous le PRU"]
     if ohlc is None or ohlc.empty or len(ohlc) < 40:
         return pd.DataFrame(columns=colonnes)
@@ -132,10 +136,10 @@ def niveaux(ohlc: pd.DataFrame, pru: float = np.nan) -> pd.DataFrame:
         lignes.append({
             "Horizon": nom,
             "Stop": stop,
-            "Distance stop (%)": (stop / actuel - 1) * 100,
+            "Marge (%)": (1 - stop / actuel) * 100,
             "Objectif": objectif,
-            "Distance objectif (%)": (np.nan if franchi
-                                      else (objectif / actuel - 1) * 100),
+            "Potentiel (%)": (np.nan if franchi
+                              else (objectif / actuel - 1) * 100),
             "Risque (%)": risque,
             "Gain visé (%)": np.nan if franchi else p["gain"] * risque,
             "Résistance": plus_haut,

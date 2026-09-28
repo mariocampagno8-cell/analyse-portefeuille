@@ -557,7 +557,9 @@ for _, ligne in univers.iterrows():
         "Gain (%)": ((cours_actuel / ligne["PRU"] - 1) * 100
                      if np.isfinite(ligne["PRU"]) and ligne["PRU"] > 0 else np.nan),
         "Stop": bornes["sortie"],
-        "Marge (%)": ((bornes["sortie"] / cours_actuel - 1) * 100
+        # Meme convention que le module des niveaux : positif, il reste de la
+        # marge avant le stop ; negatif, le cours est deja passe dessous.
+        "Marge (%)": ((1 - bornes["sortie"] / cours_actuel) * 100
                       if _fini(bornes["sortie"]) else np.nan),
         "Manuel": bool(bornes["sortie_manuelle"])})
 
@@ -656,9 +658,9 @@ st.dataframe(
                  "colonne « Prix sortie » de ta feuille impose une valeur."),
         "Marge (%)": st.column_config.NumberColumn(
             format="%+.1f %%",
-            help="Baisse que le cours peut encore encaisser avant de toucher "
-                 "le stop. Une valeur positive signifie que la ligne est "
-                 "déjà passée sous son seuil."),
+            help="Baisse encore encaissable avant de toucher le stop. "
+                 "Positive : le cours est au-dessus du stop. Négative : il "
+                 "est déjà passé dessous."),
         "Manuel": st.column_config.CheckboxColumn(
             help="Coché : le stop vient de ta feuille. Décoché : il est calculé."),
     })
@@ -701,7 +703,7 @@ with onglets_niveaux[0]:
 
             valeur = float(detenues.at[t, "Valeur"])
             part = valeur / total * 100 if total > 0 else np.nan
-            marge = s["Distance stop (%)"]
+            marge = s["Marge (%)"]
             franchi = bool(s["Franchi"])
 
             # Une ligne franchie n'a plus de perte "si stop" : elle est deja
@@ -711,7 +713,7 @@ with onglets_niveaux[0]:
             recap.append({
                 "Ticker": t,
                 "Statut": ("🔴 franchi" if franchi
-                           else "🟠 proche" if marge > -PROXIMITE_SEUIL
+                           else "🟠 proche" if marge < PROXIMITE_SEUIL
                            else "🟢 dans l'enveloppe"),
                 "Poids (%)": part,
                 "Cours": float(detenues.at[t, "Cours"]),
@@ -722,7 +724,7 @@ with onglets_niveaux[0]:
                                    else cout / total * 100 if total > 0
                                    else np.nan),
                 "Objectif": s["Objectif"],
-                "Potentiel (%)": s["Distance objectif (%)"],
+                "Potentiel (%)": s["Potentiel (%)"],
                 "_franchi": franchi})
 
     if not recap:
@@ -767,8 +769,9 @@ with onglets_niveaux[0]:
                     max_value=float(table_n["Poids (%)"].max() or 100)),
                 "Marge (%)": st.column_config.NumberColumn(
                     format="%+.1f %%",
-                    help="Baisse encaissable avant de toucher le stop. "
-                         "Positive : le stop est déjà dépassé."),
+                    help="Baisse encore encaissable avant de toucher le stop. "
+                         "Positive : le cours est au-dessus du stop. "
+                         "Négative : il est déjà passé dessous."),
                 f"Coût ({devise_base})": st.column_config.NumberColumn(
                     format="%.0f",
                     help="Perte si ce stop se déclenchait maintenant. Vide "
@@ -838,11 +841,12 @@ with onglets_niveaux[1]:
                         "séances. À cet horizon, la position est sortie de son "
                         "enveloppe de risque : l'objectif n'a plus de sens.")
                 else:
+                    marge_r = float(r["Marge (%)"])
+                    potentiel_r = float(r["Potentiel (%)"])
                     milieu.metric("Stop", f"{r['Stop']:.2f}",
-                                  f"{r['Distance stop (%)']:+.1f} %",
-                                  delta_color="inverse")
+                                  f"{marge_r:+.1f} % de marge")
                     droite.metric("Objectif", f"{r['Objectif']:.2f}",
-                                  f"{r['Distance objectif (%)']:+.1f} %")
+                                  f"{potentiel_r:+.1f} %")
                     droite.caption(
                         f"Risque {r['Risque (%)']:.1f} % pour un gain visé de "
                         f"{r['Gain visé (%)']:.1f} % · résistance récente "
