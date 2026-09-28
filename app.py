@@ -956,14 +956,23 @@ with onglets_niveaux[2]:
     st.divider()
     st.markdown("**Tes lignes actuelles, mesurées à ce budget**")
 
-    base = detenues.join(
-        pd.DataFrame(recap).set_index("Ticker")[["Stop"]]
-        if recap else pd.DataFrame(columns=["Stop"]))
-    if "Stop" not in base.columns or base["Stop"].isna().all():
+    # Le tableau des positions porte deja une colonne Stop — celle du stop
+    # simple du tableau de bord — alors que le budget doit s'appuyer sur le
+    # stop de l'horizon choisi. Une jointure faisait donc collision de noms.
+    # On assemble explicitement les trois colonnes necessaires.
+    niveaux_stop = (pd.DataFrame(recap).set_index("Ticker")
+                    if recap else pd.DataFrame(columns=["Stop"]))
+    base = pd.DataFrame({
+        "Valeur": detenues["Valeur"],
+        "Cours": detenues["Cours"],
+        "Stop": niveaux_stop["Stop"].reindex(detenues.index)
+        if "Stop" in niveaux_stop.columns else np.nan,
+    }).dropna(subset=["Cours", "Stop"])
+
+    if base.empty:
         st.caption("Ouvre l'onglet Vue d'ensemble pour calculer les stops.")
     else:
-        b = dm.budget_respecte(base[["Valeur", "Cours", "Stop"]].dropna(
-            subset=["Cours"]), budget, plafond)
+        b = dm.budget_respecte(base, budget, plafond)
         st.dataframe(
             b.round(2), use_container_width=True,
             column_config={
