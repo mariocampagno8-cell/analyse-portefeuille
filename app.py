@@ -59,12 +59,6 @@ PLAFOND_MOUVEMENT = rg.PLAFOND_MOUVEMENT
 PROXIMITE_SEUIL = rg.PROXIMITE_SEUIL
 CONCENTRATION = rg.CONCENTRATION
 
-HORIZON_STOP = rg.HORIZON_STOP
-STOP_SIGMA = rg.STOP_SIGMA
-STOP_MIN = rg.STOP_MIN
-STOP_MAX = rg.STOP_MAX
-FENETRE_HAUT = rg.FENETRE_HAUT
-FENETRE_MOYENNE = rg.FENETRE_MOYENNE
 
 
 st.set_page_config(page_title="FinexResearch", page_icon="◪", layout="wide")
@@ -316,46 +310,38 @@ def _fini(x) -> bool:
         return False
 
 
-def seuils_auto(prix: pd.Series) -> tuple[float, float, float]:
+def seuils_retenus(ligne: pd.Series, ohlc: pd.DataFrame,
+                   horizon: str | None = None) -> dict:
     """
-    Stop de vente et prix de repli déduits du titre lui-même.
+    Le seuil de vente d'une ligne, selon une seule et meme methode.
 
-    Le stop est un stop suiveur : plus haut des six derniers mois diminué
-    d'une marge égale à STOP_SIGMA écarts-types du rendement sur HORIZON_STOP
-    séances. Le prix de repli est la moyenne de moyen terme diminuée de la
-    moitié de cette marge — un simple niveau de patience, pas une prévision.
+    Une premiere version calculait ici un stop distinct de celui de l'onglet
+    « Stops et objectifs » : plus haut des 120 seances moins deux ecarts-types
+    du rendement, borne entre 8 et 30 %, la ou l'onglet appliquait le
+    chandelier sur l'ATR. Les deux repondaient a la meme question et
+    divergeaient de 4 a 20 % selon la volatilite du titre — deux colonnes de
+    la meme page annoncaient deux stops differents. Tout passe desormais par
+    `niveaux.niveaux`, et l'horizon choisi dans l'onglet vaut ici aussi.
 
-    Retourne (entrée, sortie, marge en %). NaN si l'historique est trop court.
+    Une valeur saisie a la main dans la feuille l'emporte toujours : c'est une
+    decision, pas une estimation.
     """
-    p = prix.dropna()
-    if len(p) < 60:
-        return (np.nan, np.nan, np.nan)
-    r = p.pct_change().dropna().tail(250)
-    if len(r) < 40 or float(r.std(ddof=1)) <= 0:
-        return (np.nan, np.nan, np.nan)
-    ecart = float(r.std(ddof=1)) * np.sqrt(HORIZON_STOP) * 100
-    marge = float(np.clip(ecart * STOP_SIGMA, STOP_MIN, STOP_MAX))
-    sortie = float(p.tail(FENETRE_HAUT).max()) * (1 - marge / 100)
-    entree = float(p.tail(FENETRE_MOYENNE).mean()) * (1 - marge / 200)
-    return (entree, sortie, marge)
+    horizon = horizon or st.session_state.get("horizon_ensemble", "Moyen terme")
+    calcule = nvx.synthese(
+        ohlc, horizon,
+        float(ligne["PRU"]) if _fini(ligne.get("PRU")) else np.nan,
+        st.session_state.get("perte_capital", nvx.PERTE_CAPITAL))
 
-
-def seuils_retenus(ligne: pd.Series, prix: pd.Series) -> dict:
-    """
-    Concilie ce que dit la feuille et ce que calcule l'application.
-
-    Une valeur saisie à la main l'emporte toujours : c'est une décision, pas
-    une estimation. Sinon le calcul prend le relais, et l'origine est
-    conservée pour être affichée honnêtement.
-    """
-    e_auto, s_auto, marge = seuils_auto(prix)
-    manuel_e, manuel_s = _fini(ligne.get("Prix entrée")), _fini(ligne.get("Prix sortie"))
+    manuel = _fini(ligne.get("Prix sortie"))
     return {
-        "entree": float(ligne["Prix entrée"]) if manuel_e else e_auto,
-        "sortie": float(ligne["Prix sortie"]) if manuel_s else s_auto,
-        "entree_manuelle": manuel_e,
-        "sortie_manuelle": manuel_s,
-        "marge": marge}# ==========================================================================
+        "sortie": (float(ligne["Prix sortie"]) if manuel
+                   else calcule.get("Stop", np.nan)),
+        "sortie_manuelle": manuel,
+        "origine": "feuille" if manuel else calcule.get("Origine", ""),
+        "horizon": horizon}
+
+
+# ==========================================================================
 # Écran
 # ==========================================================================
 
@@ -466,7 +452,8 @@ for _, ligne in univers.iterrows():
     veille = float(serie.iloc[-2]) if len(serie) > 1 else cours_actuel
     change = taux(devise_ligne, devise_base)
     quantite = ligne["Quantité"] if np.isfinite(ligne["Quantité"]) else 0.0
-    bornes = seuils_retenus(ligne, serie)
+    bornes = seuils_retenus(
+        ligne, en_unite_principale(charger_ohlc(t), monnaies.get(t)))
 
     lignes.append({
         "Ticker": t,
@@ -483,6 +470,7 @@ for _, ligne in univers.iterrows():
         # marge avant le stop ; negatif, le cours est deja passe dessous.
         "Marge (%)": ((1 - bornes["sortie"] / cours_actuel) * 100
                       if _fini(bornes["sortie"]) else np.nan),
+        "Origine": bornes["origine"],
         "Manuel": bool(bornes["sortie_manuelle"])})
 
 table = pd.DataFrame(lignes).set_index("Ticker")
@@ -1338,9 +1326,8 @@ else:
 st.divider()
 st.caption(
     f"Cours au {cours.index[-1].strftime('%d/%m/%Y')}, source Yahoo Finance. "
-    f"Les seuils sont calculés par l'application : stop suiveur à "
-    f"{STOP_SIGMA:.0f} écarts-types du plus haut des "
-    f"{FENETRE_HAUT} dernières séances, entre {STOP_MIN:.0f} et "
-    f"{STOP_MAX:.0f} %. Une valeur saisie dans les colonnes « Prix entrée » "
-    "ou « Prix sortie » de ta feuille remplace le calcul pour cette ligne."
+    f"Une seule méthode de seuil dans toute l'application : plus haut de la "
+    f"période moins un multiple de l'ATR, selon l'horizon retenu dans "
+    f"« Stops et objectifs ». Une valeur saisie dans la colonne "
+    f"« Prix sortie » de ta feuille remplace le calcul pour cette ligne."
 )

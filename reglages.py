@@ -25,13 +25,11 @@ PROXIMITE_CIBLE = 10.0           # % — approche d'un prix cible de surveillanc
 # --- Concentration
 CONCENTRATION = 25.0             # % du portefeuille sur une seule ligne
 
-# --- Stops suiveurs du tableau de bord
-HORIZON_STOP = 20                # seances — un mois de bourse
-STOP_SIGMA = 2.0                 # ecarts-types
-STOP_MIN = 8.0                   # % — plancher
-STOP_MAX = 30.0                  # % — plafond
-FENETRE_HAUT = 120               # seances — plus haut de reference
-FENETRE_MOYENNE = 50             # seances — moyenne de reference
+# --- Stops suiveurs
+# Les fenetres et les multiples d'ATR vivent dans niveaux.HORIZONS, seul
+# endroit ou ils sont definis. Une seconde serie de constantes existait ici
+# pour une methode concurrente du tableau de bord : les deux calculaient le
+# meme seuil de deux facons et divergeaient jusqu'a 20 %.
 
 # --- Seuils rapportes au prix de revient
 # Perte maximale acceptee sur une position, en % du prix paye. C'est une

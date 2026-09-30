@@ -277,6 +277,35 @@ def test_marge_et_resultat_au_stop_ont_des_references_differentes():
     assert r["Résultat au stop (%)"] > 0
 
 
+def test_synthese_et_niveaux_donnent_le_meme_stop():
+    """
+    Une seule méthode dans toute l'application.
+
+    Le tableau des positions passait par un calcul distinct de celui de
+    l'onglet — écart-type du rendement d'un côté, ATR de l'autre — et les
+    deux divergeaient de 4 à 20 % selon la volatilité. Les deux chemins
+    doivent désormais aboutir au même nombre, à la dernière décimale.
+    """
+    for vol in (0.009, 0.016, 0.030, 0.060):
+        d = bougies(vol, 100.0, 0.0005)
+        table = nv.niveaux(d)
+        for horizon in nv.HORIZONS:
+            par_synthese = nv.synthese(d, horizon)["Stop"]
+            par_table = float(
+                table[table["Horizon"] == horizon].iloc[0]["Stop"])
+            assert proche(par_synthese, par_table, 1e-12)
+
+
+def test_le_stop_de_capital_suit_les_deux_chemins():
+    d = bougies(0.016, 100.0, 0.0005)
+    actuel = float(d["Close"].iloc[-1])
+    for pru in (actuel * 0.7, actuel * 1.3):
+        s = nv.synthese(d, "Moyen terme", pru, 15.0)
+        table = nv.niveaux(d, pru, 15.0)
+        attendu = float(table[table["Horizon"] == "Moyen terme"].iloc[0]["Stop"])
+        assert proche(s["Stop"], attendu, 1e-12)
+
+
 def test_rsi_sature_aux_bornes():
     """Que des hausses : 100. Que des baisses : 0. Aucune ambiguïté."""
     assert proche(nv.rsi(pd.Series(np.arange(100.0, 130.0))).iloc[-1], 100.0, 1e-9)
