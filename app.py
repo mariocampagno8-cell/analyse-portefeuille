@@ -51,6 +51,11 @@ import validation as val
 
 ONGLET_MOUVEMENTS = rg.ONGLET_MOUVEMENTS
 
+# Horizon retenu pour le tableau des positions et la vue
+# d'ensemble. Les trois horizons restent consultables ligne par
+# ligne dans l'onglet de détail.
+HORIZON_TABLEAU = "Moyen terme"
+
 # Les seuils sont dans reglages.py, partagé avec la veille Telegram : deux
 # programmes qui regardent le même portefeuille doivent dire la même chose.
 SIGMA_MOUVEMENT = rg.SIGMA_MOUVEMENT
@@ -326,11 +331,11 @@ def seuils_retenus(ligne: pd.Series, ohlc: pd.DataFrame,
     Une valeur saisie a la main dans la feuille l'emporte toujours : c'est une
     decision, pas une estimation.
     """
-    horizon = horizon or st.session_state.get("horizon_ensemble", "Moyen terme")
+    horizon = horizon or HORIZON_TABLEAU
     calcule = nvx.synthese(
         ohlc, horizon,
         float(ligne["PRU"]) if _fini(ligne.get("PRU")) else np.nan,
-        st.session_state.get("perte_capital", nvx.PERTE_CAPITAL))
+        nvx.PERTE_CAPITAL)
 
     manuel = _fini(ligne.get("Prix sortie"))
     return {
@@ -612,16 +617,17 @@ st.subheader("Stops et objectifs")
 onglets_niveaux = st.tabs(["Vue d'ensemble", "Détail d'une ligne"])
 
 with onglets_niveaux[0]:
+    horizon = HORIZON_TABLEAU
+    perte_capital = nvx.PERTE_CAPITAL
+
     barre = st.columns([4, 1])
-    with barre[0]:
-        horizon = st.radio(
-            "Horizon", list(nvx.HORIZONS.keys()), index=1, horizontal=True,
-            key="horizon_ensemble",
-            help="Court : quelques semaines. Moyen : quelques mois. "
-                 "Long : un an et plus. Seule la fenêtre d'observation "
-                 "change, la méthode est la même.")
+    barre[0].caption(
+        f"Seuils à {horizon.lower()} — plus haut des "
+        f"{nvx.HORIZONS[horizon]['fenetre']} dernières séances moins "
+        f"{nvx.HORIZONS[horizon]['atr']} ATR, ou ton prix de revient moins "
+        f"{perte_capital:.0f} % si celui-ci mord le premier. Les trois "
+        f"horizons figurent dans « Détail d'une ligne ».")
     with barre[1]:
-        st.write("")
         if st.button("↻ Recalculer", use_container_width=True,
                      help="Retélécharge les cours et recalcule les seuils. "
                           "Sans cela ils se rafraîchissent d'eux-mêmes "
@@ -630,12 +636,6 @@ with onglets_niveaux[0]:
             charger_cours.clear()
             st.rerun()
 
-    perte_capital = st.slider(
-        "Perte maximale acceptée sur une position (% du prix de revient)",
-        5.0, 40.0, nvx.PERTE_CAPITAL, 2.5, key="perte_capital",
-        help="Second stop, calculé sur ce que tu as payé et non sur le "
-             "marché. À la baisse, c'est le plus haut des deux qui se "
-             "déclenche en premier ; la colonne Origine dit lequel.")
     recap = []
     with st.spinner("Calcul des niveaux…"):
         for t in detenues.index:
@@ -785,9 +785,7 @@ with onglets_niveaux[1]:
     else:
         pru_n = (float(detenues.at[choix_n, "PRU"])
                  if np.isfinite(detenues.at[choix_n, "PRU"]) else np.nan)
-        detail = nvx.niveaux(ohlc, pru_n,
-                             st.session_state.get('perte_capital',
-                                                  nvx.PERTE_CAPITAL))
+        detail = nvx.niveaux(ohlc, pru_n, nvx.PERTE_CAPITAL)
         actuel_n = float(ohlc["Close"].iloc[-1])
         st.caption(f"Cours {actuel_n:.2f} · amplitude moyenne d'une séance "
                    f"{nvx.volatilite_relative(ohlc):.2f} %"
