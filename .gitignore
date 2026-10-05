@@ -1,0 +1,13 @@
+# Bytecode Python, régénéré à chaque exécution
+__pycache__/
+*.pyc
+*.pyo
+
+# Environnement virtuel local
+.venv/
+venv/
+
+# Secrets Streamlit — ne doivent jamais partir sur un dépôt public
+.streamlit/secrets.toml
+*.json.key
+service_account*.json
