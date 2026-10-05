@@ -48,6 +48,7 @@ import performance as pfm
 # entiere de ce probleme.
 importlib.reload(pfm)
 import reglages as rg
+import secteurs as sec
 import validation as val
 
 ONGLET_MOUVEMENTS = rg.ONGLET_MOUVEMENTS
@@ -1316,19 +1317,55 @@ else:
             help="Sans plafond, la variance minimale concentre sur deux ou "
                  "trois valeurs peu volatiles.")
 
+        reglages_sect = st.columns(2)
+        plancher_tech = reglages_sect[0].slider(
+            "Technologie américaine, minimum (%)", 0.0, 80.0,
+            opt.PLANCHER_TECH_US, 5.0, key="opt_tech",
+            help="Poids cumulé imposé aux valeurs technologiques cotées aux "
+                 "États-Unis, quelle que soit la méthode.")
+        plafond_secteur = reglages_sect[1].slider(
+            "Plafond par autre secteur (%)", 10.0, 100.0,
+            opt.PLAFOND_SECTEUR, 5.0, key="opt_secteur",
+            help="S'applique à chaque secteur hors technologie américaine. "
+                 "100 % revient à ne pas contraindre.")
+
+        # La technologie US compte 13 valeurs dans l'univers : un plancher
+        # trop haut face a un plafond par ligne trop bas est infaisable.
+        tech_univers = [t for t in rdt_univers.columns
+                        if sec.secteur(t) == sec.TECH_US]
+        capacite_tech = len(tech_univers) * plafond_opt
+        if plancher_tech > capacite_tech:
+            st.warning(
+                f"Plancher ramené à {capacite_tech:.0f} % : "
+                f"{len(tech_univers)} valeur(s) technologiques US plafonnées "
+                f"à {plafond_opt:.0f} % chacune ne peuvent pas peser plus. "
+                f"Relève le plafond par ligne pour aller au-delà.",
+                icon="⚠️")
+            plancher_tech = capacite_tech
+
+        regles_sect = opt.contraintes_sectorielles(
+            list(rdt_univers.columns), plancher_tech, plafond_secteur)
+
         with st.spinner("Optimisation…"):
             allocations, resume = {}, []
             for methode in opt.METHODES:
-                poids = opt.selectionner(methode, covariance, esperances,
-                                         nombre_lignes, plafond_opt)
+                poids = opt.selectionner(
+                    methode, covariance, esperances, nombre_lignes,
+                    plafond_opt, opt.PLANCHER_LIGNE,
+                    plancher_tech, plafond_secteur)
                 allocations[methode] = poids
                 sous_cov = covariance.loc[poids.index, poids.index]
                 m = opt.mesures(poids, sous_cov, esperances)
+                expo = opt.exposition_sectorielle(poids)
+                autres = expo.drop(sec.TECH_US, errors="ignore")
                 resume.append({
                     "Méthode": methode,
                     "Volatilité (%)": m["volatilite"],
                     "Rendement passé (%)": m["rendement"],
                     "Rendement / risque": m["sharpe"],
+                    "Tech US (%)": float(expo.get(sec.TECH_US, 0.0)),
+                    "Secteur le plus lourd hors tech (%)": (
+                        float(autres.iloc[0]) if len(autres) else 0.0),
                     "Lignes effectives": m["lignes_effectives"],
                     "Poids max (%)": m["poids_max"],
                     "Sans prévision": methode in opt.SANS_ESPERANCES})
@@ -1347,6 +1384,15 @@ else:
                          "prévision."),
                 "Rendement / risque": st.column_config.NumberColumn(
                     format="%.2f"),
+                "Tech US (%)": st.column_config.NumberColumn(
+                    format="%.1f %%",
+                    help="Poids cumulé des valeurs technologiques cotées aux "
+                         "États-Unis. L'équipondéré ne respecte aucune "
+                         "contrainte : sa valeur est un simple comptage."),
+                "Secteur le plus lourd hors tech (%)":
+                    st.column_config.NumberColumn(
+                        format="%.1f %%",
+                        help="Doit rester sous le plafond par secteur."),
                 "Lignes effectives": st.column_config.NumberColumn(
                     format="%.1f",
                     help="Inverse de l'indice de Herfindahl. Vingt lignes "
@@ -1359,18 +1405,21 @@ else:
             })
 
         st.info(
-            "**« Variance minimum » et « rendement maximum » sont deux "
-            "objectifs opposés, pas un seul portefeuille.** Le tableau "
-            "ci-dessus montre le compromis : la variance minimale paie sa "
-            "stabilité par un rendement plus faible, le Sharpe maximal "
-            "affiche le meilleur rapport — mais sur le passé, puisqu'il "
-            "choisit précisément ce qui a déjà monté. Les deux méthodes "
-            "cochées « sans prévision » ne reposent que sur la covariance, "
-            "nettement plus stable dans le temps que les rendements.", icon="⚖️")
+            "**« Rendement maximal » est une borne, pas une allocation à "
+            "suivre.** C'est le rendement le plus élevé que les contraintes "
+            "ci-dessus autorisent *sur les trois dernières années* : "
+            "l'optimiseur achète ce qui a déjà monté, et rien dans le calcul "
+            "ne dit que cela continuera. « Sharpe maximal » cherche le "
+            "meilleur rapport au risque et reste exposé au même biais. Les "
+            "méthodes cochées « sans prévision » ne reposent que sur la "
+            "covariance, nettement plus stable dans le temps que les "
+            "rendements : ce sont les seules dont l'avantage survit "
+            "généralement hors échantillon.", icon="⚖️")
 
         # --- Frontière des compromis
         with st.spinner("Frontière…"):
-            courbe = opt.frontiere(covariance, esperances, 20, plafond_opt)
+            courbe = opt.frontiere(covariance, esperances, 20, plafond_opt,
+                                   regles_sect)
 
         if not courbe.empty:
             import plotly.graph_objects as go
@@ -1422,6 +1471,7 @@ else:
         poids_choisi = allocations[choix_methode].sort_values(ascending=False)
         detail_opt = pd.DataFrame({
             "Poids (%)": poids_choisi * 100,
+            "Secteur": [sec.secteur(t) for t in poids_choisi.index],
             "Volatilité seule (%)": np.sqrt(np.diag(
                 covariance.loc[poids_choisi.index,
                                poids_choisi.index].to_numpy())) * 100,
@@ -1437,6 +1487,45 @@ else:
                 "Rendement passé (%)": st.column_config.NumberColumn(
                     format="%+.1f %%"),
             })
+
+        # --- Répartition sectorielle de l'allocation retenue
+        expo_choisie = opt.exposition_sectorielle(poids_choisi)
+        if not expo_choisie.empty:
+            table_sect = pd.DataFrame({
+                "Poids (%)": expo_choisie,
+                "Lignes": [sum(1 for t in poids_choisi.index
+                               if sec.secteur(t) == nom)
+                           for nom in expo_choisie.index]})
+            st.dataframe(
+                table_sect.round(2), use_container_width=True,
+                column_config={
+                    "Poids (%)": st.column_config.ProgressColumn(
+                        format="%.1f %%", min_value=0,
+                        max_value=float(expo_choisie.max())),
+                })
+            tech_obtenue = float(expo_choisie.get(sec.TECH_US, 0.0))
+            if choix_methode == "Équipondéré":
+                st.caption(
+                    f"L'équipondéré porte l'univers entier et ne respecte "
+                    f"aucune contrainte : sa technologie US ressort à "
+                    f"{tech_obtenue:.1f} % par simple comptage. C'est le "
+                    f"témoin, pas une allocation contrainte.")
+            elif tech_obtenue + 1e-6 < plancher_tech:
+                st.warning(
+                    f"Technologie US à {tech_obtenue:.1f} % alors que le "
+                    f"plancher demandé est {plancher_tech:.0f} % : "
+                    f"l'optimiseur n'a pas trouvé de solution admissible. "
+                    f"Desserre le plafond par ligne ou par secteur.",
+                    icon="⚠️")
+            else:
+                st.caption(
+                    f"Technologie US : {tech_obtenue:.1f} % "
+                    f"(plancher {plancher_tech:.0f} %). Un plancher "
+                    f"sectoriel déplace le portefeuille vers un secteur "
+                    f"choisi d'avance : il améliore le rendement si ce "
+                    f"secteur continue de monter, et l'aggrave sinon. "
+                    f"L'optimiseur exécute la contrainte, il ne la valide "
+                    f"pas.")
 
         ecartes_du_portefeuille = sorted(
             set(detenues.index) - set(poids_choisi.index))
@@ -1459,7 +1548,10 @@ else:
                 f"trois ans d'historique quotidien, covariance retrécie de "
                 f"{opt.RETRECISSEMENT:.0%} vers une cible à corrélation "
                 f"constante. Plafond de {plafond_opt:.0f} % par ligne, "
-                f"plancher de {opt.PLANCHER_LIGNE:.0f} %. Le portefeuille "
+                f"plancher de {opt.PLANCHER_LIGNE:.0f} %. Contraintes "
+                f"sectorielles : technologie américaine au moins "
+                f"{plancher_tech:.0f} %, chaque autre secteur au plus "
+                f"{plafond_secteur:.0f} %. Le portefeuille "
                 f"réel de l'utilisateur compte {len(detenues)} lignes dont "
                 f"la plus lourde pèse "
                 f"{float(detenues['Valeur'].max()) / total * 100:.0f} %."

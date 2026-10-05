@@ -35,6 +35,8 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
+import secteurs as sec
+
 JOURS_BOURSE = 252.0
 
 # Retrecissement de la covariance vers une cible a correlation constante.
@@ -50,6 +52,14 @@ PLAFOND_LIGNE = 15.0        # % — poids maximal d'une ligne
 # annonce vingt lignes et en detient treize. Un plancher rend le compte exact
 # et evite les positions trop petites pour justifier leurs frais.
 PLANCHER_LIGNE = 1.0        # % — poids minimal d'une ligne retenue
+
+# Contraintes sectorielles. Le plancher sur la technologie americaine est une
+# conviction de l'investisseur, pas un resultat de calcul : l'optimiseur la
+# respecte sans la discuter. Le plafond sur les autres secteurs est ce qui
+# empeche le solde de se concentrer ailleurs — sans lui, « diversifie » ne
+# veut rien dire.
+PLANCHER_TECH_US = 40.0     # % — exposition minimale a la technologie US
+PLAFOND_SECTEUR = 25.0      # % — par secteur autre que la technologie US
 PLANCHER_OBSERVATIONS = 120  # seances minimales pour estimer quoi que ce soit
 
 
@@ -111,6 +121,45 @@ def _contraintes(n: int, plafond: float, plancher: float = 0.0):
     return bornes, [somme]
 
 
+def contraintes_sectorielles(actifs, plancher_tech: float = PLANCHER_TECH_US,
+                             plafond_secteur: float = PLAFOND_SECTEUR) -> list:
+    """
+    Traduit les regles de secteur en contraintes d'inegalite.
+
+    SLSQP attend des fonctions positives ou nulles a l'optimum. Le plancher
+    technologique s'ecrit « somme des poids tech moins le seuil >= 0 », le
+    plafond d'un secteur « seuil moins somme des poids du secteur >= 0 ».
+
+    Un jeu de contraintes infaisable ne produit pas d'erreur : SLSQP rend un
+    vecteur quelconque, silencieusement faux. Les plafonds sont donc ecartes
+    quand ils ne laissent pas de quoi placer 100 % du portefeuille — par
+    exemple si l'univers entier tient dans un seul secteur non technologique.
+    """
+    actifs = list(actifs)
+    groupes = sec.par_secteur(actifs)
+    index = {t: i for i, t in enumerate(actifs)}
+    regles = []
+
+    tech = [index[t] for t in groupes.get(sec.TECH_US, [])]
+    if tech and plancher_tech > 0:
+        regles.append({"type": "ineq",
+                       "fun": (lambda w, i=tech, s=plancher_tech / 100:
+                               float(np.sum(w[i])) - s)})
+
+    autres = [nom for nom in groupes if nom != sec.TECH_US]
+    # La technologie n'a pas de plafond ici : elle peut absorber le reste.
+    capacite = plafond_secteur * len(autres) + (100.0 if tech else 0.0)
+    if plafond_secteur >= 100 or capacite < 100.0:
+        return regles
+
+    for nom in autres:
+        positions = [index[t] for t in groupes[nom]]
+        regles.append({"type": "ineq",
+                       "fun": (lambda w, i=positions, s=plafond_secteur / 100:
+                               s - float(np.sum(w[i])))})
+    return regles
+
+
 def _resoudre(objectif, n: int, plafond: float, contraintes_sup=None,
               plancher: float = 0.0):
     bornes, contraintes = _contraintes(n, plafond, plancher)
@@ -127,16 +176,17 @@ def _resoudre(objectif, n: int, plafond: float, contraintes_sup=None,
 
 def variance_minimale(cov: pd.DataFrame,
                       plafond: float = PLAFOND_LIGNE,
-                      plancher: float = 0.0) -> pd.Series:
+                      plancher: float = 0.0, regles=None) -> pd.Series:
     """Le portefeuille le moins volatil. Ne depend que de la covariance."""
     matrice = cov.to_numpy()
-    poids = _resoudre(lambda w: float(w @ matrice @ w), len(cov), plafond, plancher=plancher)
+    poids = _resoudre(lambda w: float(w @ matrice @ w), len(cov), plafond,
+                      regles, plancher=plancher)
     return pd.Series(poids, index=cov.index)
 
 
 def parite_risque(cov: pd.DataFrame,
                   plafond: float = PLAFOND_LIGNE,
-                  plancher: float = 0.0) -> pd.Series:
+                  plancher: float = 0.0, regles=None) -> pd.Series:
     """
     Chaque ligne contribue autant au risque total.
 
@@ -153,14 +203,14 @@ def parite_risque(cov: pd.DataFrame,
         contributions = w * (matrice @ w) / np.sqrt(variance)
         return float(np.sum((contributions - contributions.mean()) ** 2))
 
-    return pd.Series(_resoudre(ecart_aux_contributions, n, plafond, plancher=plancher),
-                     index=cov.index)
+    return pd.Series(_resoudre(ecart_aux_contributions, n, plafond, regles,
+                               plancher=plancher), index=cov.index)
 
 
 def sharpe_maximal(cov: pd.DataFrame, esperances: pd.Series,
                    plafond: float = PLAFOND_LIGNE,
                    sans_risque: float = 0.0,
-                   plancher: float = 0.0) -> pd.Series:
+                   plancher: float = 0.0, regles=None) -> pd.Series:
     """
     Le meilleur rapport rendement sur volatilite — sur le passe.
 
@@ -177,8 +227,28 @@ def sharpe_maximal(cov: pd.DataFrame, esperances: pd.Series,
             return 1e6
         return -(float(w @ mu) - sans_risque) / volatilite
 
-    return pd.Series(_resoudre(negatif_du_sharpe, len(cov), plafond, plancher=plancher),
-                     index=cov.index)
+    return pd.Series(_resoudre(negatif_du_sharpe, len(cov), plafond, regles,
+                               plancher=plancher), index=cov.index)
+
+
+def rendement_maximal(cov: pd.DataFrame, esperances: pd.Series,
+                      plafond: float = PLAFOND_LIGNE,
+                      plancher: float = 0.0,
+                      regles=None) -> pd.Series:
+    """
+    Le rendement passe le plus eleve que les contraintes autorisent.
+
+    C'est l'allocation la plus fragile de toutes : elle ne regarde que ce qui
+    a deja monte et n'oppose aucune resistance a la concentration, sinon le
+    plafond par ligne et les regles de secteur. Elle a sa place ici comme
+    borne superieure — le maximum atteignable sous ces contraintes — et non
+    comme une allocation a suivre.
+    """
+    mu = esperances.reindex(cov.index).fillna(0.0).to_numpy()
+    return pd.Series(
+        _resoudre(lambda w: -float(w @ mu), len(cov), plafond, regles,
+                  plancher=plancher),
+        index=cov.index)
 
 
 def equipondere(actifs) -> pd.Series:
@@ -188,9 +258,10 @@ def equipondere(actifs) -> pd.Series:
 
 
 METHODES = {
-    "Variance minimale": "variance_minimale",
-    "Parité de risque": "parite_risque",
+    "Rendement maximal": "rendement_maximal",
     "Sharpe maximal": "sharpe_maximal",
+    "Parité de risque": "parite_risque",
+    "Variance minimale": "variance_minimale",
     "Équipondéré": "equipondere",
 }
 
@@ -201,13 +272,20 @@ SANS_ESPERANCES = {"Variance minimale", "Parité de risque", "Équipondéré"}
 
 def allouer(methode: str, cov: pd.DataFrame, esperances: pd.Series,
             plafond: float = PLAFOND_LIGNE,
-            plancher: float = 0.0) -> pd.Series:
-    if methode == "Variance minimale":
-        return variance_minimale(cov, plafond, plancher)
-    if methode == "Parité de risque":
-        return parite_risque(cov, plafond, plancher)
+            plancher: float = 0.0, regles=None) -> pd.Series:
+    """
+    L'equipondere ne prend pas de regles : il n'optimise rien, donc il ne
+    peut rien respecter. Son exposition sectorielle est celle de l'univers,
+    et c'est precisement ce qui en fait un temoin utile.
+    """
+    if methode == "Rendement maximal":
+        return rendement_maximal(cov, esperances, plafond, plancher, regles)
     if methode == "Sharpe maximal":
-        return sharpe_maximal(cov, esperances, plafond, 0.0, plancher)
+        return sharpe_maximal(cov, esperances, plafond, 0.0, plancher, regles)
+    if methode == "Parité de risque":
+        return parite_risque(cov, plafond, plancher, regles)
+    if methode == "Variance minimale":
+        return variance_minimale(cov, plafond, plancher, regles)
     return equipondere(cov.index)
 
 
@@ -218,7 +296,9 @@ def allouer(methode: str, cov: pd.DataFrame, esperances: pd.Series,
 def selectionner(methode: str, cov: pd.DataFrame, esperances: pd.Series,
                  nombre: int = 20,
                  plafond: float = PLAFOND_LIGNE,
-                 plancher: float = PLANCHER_LIGNE) -> pd.Series:
+                 plancher: float = PLANCHER_LIGNE,
+                 plancher_tech: float = PLANCHER_TECH_US,
+                 plafond_secteur: float = PLAFOND_SECTEUR) -> pd.Series:
     """
     Reduit l'univers au nombre de lignes voulu, puis alloue.
 
@@ -230,9 +310,22 @@ def selectionner(methode: str, cov: pd.DataFrame, esperances: pd.Series,
     cardinalite, qui est combinatoire et hors de portee ici. C'est une
     heuristique courante, et elle doit etre lue comme telle.
     """
+    # L'equipondere n'a aucun critere pour choisir vingt valeurs sur
+    # trente-et-une : tous ses poids sont egaux, et le retrait de la « plus
+    # faible » revient a tirer au sort. Comme temoin, il porte donc l'univers
+    # entier — c'est aussi ce qui en fait une reference honnete, puisqu'il ne
+    # beneficie d'aucune selection.
+    if methode == "Équipondéré":
+        return equipondere(cov.index)
+
     retenus = list(cov.index)
+
+    def regles(actifs):
+        return contraintes_sectorielles(actifs, plancher_tech, plafond_secteur)
+
     if nombre >= len(retenus):
-        return allouer(methode, cov, esperances, plafond)
+        return allouer(methode, cov, esperances, plafond, 0.0,
+                       regles(retenus))
 
     # Le plafond doit laisser la somme atteindre 1 sur le nombre final, et le
     # plancher ne doit pas la depasser.
@@ -241,13 +334,28 @@ def selectionner(methode: str, cov: pd.DataFrame, esperances: pd.Series,
 
     # L'elimination se fait sans plancher : il fausserait le classement en
     # donnant le meme poids minimal a toutes les lignes faibles.
+    # L'elimination doit preserver de quoi satisfaire le plancher sectoriel :
+    # retirer toutes les valeurs technologiques rendrait le probleme
+    # insoluble, et l'optimiseur renverrait silencieusement n'importe quoi.
     while len(retenus) > nombre:
         poids = allouer(methode, cov.loc[retenus, retenus],
-                        esperances.reindex(retenus), plafond)
-        retenus.remove(poids.idxmin())
+                        esperances.reindex(retenus), plafond, 0.0,
+                        regles(retenus))
+        candidate = poids.idxmin()
+        tech_restantes = [t for t in retenus if sec.secteur(t) == sec.TECH_US]
+        besoin_tech = int(np.ceil(plancher_tech / plafond))
+        if (sec.secteur(candidate) == sec.TECH_US
+                and len(tech_restantes) <= besoin_tech):
+            # Protegee : on retire la plus faible parmi les autres.
+            autres = poids.drop([t for t in tech_restantes if t in poids.index])
+            if autres.empty:
+                break
+            candidate = autres.idxmin()
+        retenus.remove(candidate)
 
     return allouer(methode, cov.loc[retenus, retenus],
-                   esperances.reindex(retenus), plafond, plancher)
+                   esperances.reindex(retenus), plafond, plancher,
+                   regles(retenus))
 
 
 # ==========================================================================
@@ -275,13 +383,18 @@ def mesures(poids: pd.Series, cov: pd.DataFrame,
 
 
 def frontiere(cov: pd.DataFrame, esperances: pd.Series, points: int = 25,
-              plafond: float = PLAFOND_LIGNE) -> pd.DataFrame:
+              plafond: float = PLAFOND_LIGNE, regles=None) -> pd.DataFrame:
     """
     La courbe des compromis : volatilite minimale pour chaque rendement visé.
 
     C'est elle qui montre qu'un « portefeuille optimal » unique n'existe pas.
     Chaque point est optimal pour un niveau de risque accepté, et le choix de
     ce niveau n'est pas un calcul.
+
+    `regles` recoit les memes contraintes sectorielles que les allocations :
+    sans elles, la courbe serait celle d'un univers plus libre et les
+    methodes se placeraient au-dessus d'une frontiere qu'elles ne peuvent
+    pas atteindre — une comparaison fausse.
     """
     mu = esperances.reindex(cov.index).fillna(0.0).to_numpy()
     matrice = cov.to_numpy()
@@ -289,8 +402,13 @@ def frontiere(cov: pd.DataFrame, esperances: pd.Series, points: int = 25,
     if n == 0:
         return pd.DataFrame(columns=["Rendement (%)", "Volatilité (%)"])
 
-    bas = float(mu @ variance_minimale(cov, plafond).to_numpy())
-    haut = float(np.sort(mu)[-max(1, int(np.ceil(100 / plafond))):].mean())
+    regles = list(regles or [])
+    bas = float(mu @ variance_minimale(cov, plafond,
+                                       regles=regles).to_numpy())
+    # Borne haute : le rendement du portefeuille le plus agressif admissible,
+    # contraintes comprises, et non la moyenne des meilleures esperances.
+    haut = float(mu @ rendement_maximal(cov, esperances, plafond,
+                                        regles=regles).to_numpy())
     if not np.isfinite(bas) or not np.isfinite(haut) or haut <= bas:
         return pd.DataFrame(columns=["Rendement (%)", "Volatilité (%)"])
 
@@ -299,8 +417,21 @@ def frontiere(cov: pd.DataFrame, esperances: pd.Series, points: int = 25,
         contrainte = {"type": "eq",
                       "fun": (lambda w, c=cible: float(w @ mu) - c)}
         poids = _resoudre(lambda w: float(w @ matrice @ w), n, plafond,
-                          [contrainte])
+                          regles + [contrainte])
         variance = float(poids @ matrice @ poids)
         lignes.append({"Rendement (%)": float(poids @ mu) * 100,
                        "Volatilité (%)": float(np.sqrt(variance)) * 100})
     return pd.DataFrame(lignes)
+
+
+def exposition_sectorielle(poids: pd.Series) -> pd.Series:
+    """Poids cumulé par secteur, du plus lourd au plus leger, en %."""
+    if poids is None or poids.empty:
+        return pd.Series(dtype=float)
+    cumul: dict[str, float] = {}
+    for ticker, w in poids.items():
+        nom = sec.secteur(ticker)
+        cumul[nom] = cumul.get(nom, 0.0) + float(w) * 100
+    serie = pd.Series(cumul).sort_values(ascending=False)
+    serie.index.name = "Secteur"
+    return serie

@@ -25,6 +25,7 @@ import niveaux as nv
 import optimal as opt
 import performance as pf
 import reglages as rg
+import secteurs as sec
 import validation as val
 
 
@@ -674,7 +675,10 @@ def test_selection_retient_exactement_le_nombre_demande():
     cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
     for methode in opt.METHODES:
         w = opt.selectionner(methode, cov, esp, 20, 15.0)
-        assert len(w) == 20
+        # L'équipondéré porte l'univers entier : sélectionner vingt lignes
+        # au hasard parmi des poids tous égaux n'aurait aucun sens.
+        attendu = len(cov.index) if methode == "Équipondéré" else 20
+        assert len(w) == attendu, (methode, len(w))
         assert proche(w.sum(), 1.0, 1e-6)
         assert bool((w >= -1e-9).all())
 
@@ -689,7 +693,8 @@ def test_toutes_les_lignes_retenues_sont_reellement_detenues():
     cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
     for methode in opt.METHODES:
         w = opt.selectionner(methode, cov, esp, 20, 15.0)
-        assert int((w > 1e-6).sum()) == 20
+        attendu = len(cov.index) if methode == "Équipondéré" else 20
+        assert int((w > 1e-6).sum()) == attendu, (methode, int((w > 1e-6).sum()))
 
 
 def test_le_plafond_est_respecte():
@@ -743,6 +748,107 @@ def test_univers_plus_petit_que_la_cible():
     w = opt.selectionner("Variance minimale", cov, esp, 20, 100.0)
     assert len(w) == 10
     assert proche(w.sum(), 1.0, 1e-6)
+
+
+def _univers_sectoriel(n_obs=750, graine=11):
+    """Univers simulé portant les vrais tickers, donc les vrais secteurs."""
+    tickers = sorted(sec.SECTEURS)
+    rng = np.random.default_rng(graine)
+    facteurs = rng.normal(0, 0.011, (n_obs, 3))
+    charges = np.zeros((len(tickers), 3))
+    for i in range(len(tickers)):
+        charges[i, i % 3] = rng.uniform(0.6, 1.4)
+    vol = rng.uniform(0.008, 0.045, len(tickers))
+    return pd.DataFrame(
+        facteurs @ charges.T + rng.normal(0, 1, (n_obs, len(tickers))) * vol,
+        columns=tickers)
+
+
+def test_classement_sectoriel_couvre_la_liste():
+    """Tout ticker surveillé a un secteur, et la tech US en compte assez."""
+    groupes = sec.par_secteur(sec.SECTEURS)
+    assert sec.NON_CLASSE not in groupes
+    assert len(groupes[sec.TECH_US]) >= 8
+    assert sec.secteur("inconnu_xyz") == sec.NON_CLASSE
+    # La casse et les espaces ne doivent pas changer le classement.
+    assert sec.secteur(" nvda ") == sec.TECH_US
+
+
+def test_plancher_technologique_respecte():
+    """Chaque méthode contrainte atteint le plancher demandé."""
+    r = _univers_sectoriel()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    for plancher in (40.0, 55.0, 70.0):
+        for methode in opt.METHODES:
+            if methode == "Équipondéré":
+                continue   # témoin : ne respecte aucune contrainte
+            w = opt.selectionner(methode, cov, esp, 20, 15.0,
+                                 opt.PLANCHER_LIGNE, plancher, 25.0)
+            expo = opt.exposition_sectorielle(w)
+            obtenu = float(expo.get(sec.TECH_US, 0.0))
+            assert obtenu >= plancher - 0.5, (methode, plancher, obtenu)
+
+
+def test_plafond_par_secteur_respecte():
+    r = _univers_sectoriel()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    for methode in opt.METHODES:
+        if methode == "Équipondéré":
+            continue
+        w = opt.selectionner(methode, cov, esp, 20, 15.0,
+                             opt.PLANCHER_LIGNE, 40.0, 20.0)
+        expo = opt.exposition_sectorielle(w).drop(sec.TECH_US, errors="ignore")
+        if len(expo):
+            assert float(expo.max()) <= 20.5, (methode, float(expo.max()))
+
+
+def test_contraintes_infaisables_ecartees():
+    """Un univers d'un seul secteur non tech ne doit pas rendre un faux."""
+    actifs = ["KO", "PEP", "PG", "CL"]      # consommation de base seulement
+    regles = opt.contraintes_sectorielles(actifs, 40.0, 25.0)
+    assert regles == []                     # ni plancher tech, ni plafond
+    # Avec de la tech dans l'univers, les plafonds redeviennent tenables.
+    regles = opt.contraintes_sectorielles(actifs + ["NVDA", "MU"], 40.0, 25.0)
+    assert len(regles) == 2                 # plancher tech + un plafond
+
+
+def test_rendement_maximal_domine_les_autres():
+    """La borne supérieure doit bien être une borne supérieure."""
+    r = _univers_sectoriel()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    rendements = {}
+    for methode in opt.METHODES:
+        if methode == "Équipondéré":
+            continue
+        w = opt.selectionner(methode, cov, esp, 20, 15.0)
+        sous = cov.loc[w.index, w.index]
+        rendements[methode] = opt.mesures(w, sous, esp)["rendement"]
+    borne = rendements["Rendement maximal"]
+    for methode, valeur in rendements.items():
+        assert valeur <= borne + 0.5, (methode, valeur, borne)
+
+
+def test_exposition_sectorielle_somme_a_cent():
+    r = _univers_sectoriel()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    w = opt.selectionner("Sharpe maximal", cov, esp, 20, 15.0)
+    expo = opt.exposition_sectorielle(w)
+    assert proche(float(expo.sum()), 100.0, 1e-6)
+    assert bool(expo.is_monotonic_decreasing)
+    assert opt.exposition_sectorielle(pd.Series(dtype=float)).empty
+
+
+def test_frontiere_contrainte_reste_sous_la_libre():
+    """Contraindre ne peut pas améliorer le couple risque / rendement."""
+    r = _univers_sectoriel()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    regles = opt.contraintes_sectorielles(list(cov.index), 60.0, 20.0)
+    libre = opt.frontiere(cov, esp, 8, 15.0)
+    liee = opt.frontiere(cov, esp, 8, 15.0, regles)
+    assert not libre.empty and not liee.empty
+    # Le meilleur rendement atteignable ne peut que baisser.
+    assert (float(liee["Rendement (%)"].max())
+            <= float(libre["Rendement (%)"].max()) + 0.5)
 
 
 if __name__ == "__main__":
