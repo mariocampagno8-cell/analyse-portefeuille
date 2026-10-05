@@ -22,6 +22,7 @@ import pandas as pd
 import dimension as dm
 import mouvements as mo
 import niveaux as nv
+import optimal as opt
 import performance as pf
 import reglages as rg
 import validation as val
@@ -620,6 +621,130 @@ def test_seuils_partages_identiques_partout():
     assert val.CONCENTRATION_ALERTE == rg.CONCENTRATION
 
 
+# ==========================================================================
+# optimal — allocations
+# ==========================================================================
+
+def test_variance_minimale_sur_deux_actifs_independants():
+    """Poids inversement proportionnels aux variances : 0,04 et 0,09."""
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.09]],
+                       index=["A", "B"], columns=["A", "B"])
+    w = opt.variance_minimale(cov, plafond=100.0)
+    inverse = np.array([1 / 0.04, 1 / 0.09])
+    attendu = inverse / inverse.sum()
+    assert proche(w["A"], attendu[0], 1e-6)
+    assert proche(w["B"], attendu[1], 1e-6)
+
+
+def test_parite_de_risque_sur_actifs_independants():
+    """Sans corrélation, les poids sont inversement proportionnels à sigma."""
+    cov = pd.DataFrame([[0.04, 0.0], [0.0, 0.09]],
+                       index=["A", "B"], columns=["A", "B"])
+    w = opt.parite_risque(cov, plafond=100.0)
+    inverse = np.array([1 / 0.2, 1 / 0.3])
+    attendu = inverse / inverse.sum()
+    assert proche(w["A"], attendu[0], 1e-5)
+    assert proche(w["B"], attendu[1], 1e-5)
+
+
+def test_actifs_identiques_donnent_une_repartition_egale():
+    cov = pd.DataFrame([[0.04, 0.04], [0.04, 0.04]],
+                       index=["A", "B"], columns=["A", "B"])
+    esp = pd.Series({"A": 0.08, "B": 0.08})
+    for methode in opt.METHODES:
+        w = opt.allouer(methode, cov, esp, 100.0)
+        assert proche(w["A"], 0.5, 1e-4)
+
+
+def _univers(n_act=31, n_obs=750, graine=11):
+    """Univers simulé à structure sectorielle : trois facteurs communs."""
+    rng = np.random.default_rng(graine)
+    facteurs = rng.normal(0, 0.011, (n_obs, 3))
+    charges = np.zeros((n_act, 3))
+    for i in range(n_act):
+        charges[i, i % 3] = rng.uniform(0.6, 1.4)
+    vol = rng.uniform(0.008, 0.045, n_act)
+    return pd.DataFrame(
+        facteurs @ charges.T + rng.normal(0, 1, (n_obs, n_act)) * vol,
+        columns=[f"V{i:02d}" for i in range(n_act)])
+
+
+def test_selection_retient_exactement_le_nombre_demande():
+    r = _univers()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    for methode in opt.METHODES:
+        w = opt.selectionner(methode, cov, esp, 20, 15.0)
+        assert len(w) == 20
+        assert proche(w.sum(), 1.0, 1e-6)
+        assert bool((w >= -1e-9).all())
+
+
+def test_toutes_les_lignes_retenues_sont_reellement_detenues():
+    """
+    Sans plancher, l'optimiseur attribue zéro à la moitié des lignes
+    sélectionnées : le portefeuille annonçait vingt lignes et en détenait
+    treize. Le plancher rend le compte exact.
+    """
+    r = _univers()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    for methode in opt.METHODES:
+        w = opt.selectionner(methode, cov, esp, 20, 15.0)
+        assert int((w > 1e-6).sum()) == 20
+
+
+def test_le_plafond_est_respecte():
+    r = _univers()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    for plafond in (8.0, 15.0, 25.0):
+        for methode in opt.METHODES:
+            w = opt.selectionner(methode, cov, esp, 20, plafond)
+            assert w.max() <= plafond / 100 + 1e-6
+
+
+def test_variance_minimale_est_bien_la_moins_volatile():
+    """Sur un même sous-ensemble, aucune autre méthode ne fait mieux."""
+    r = _univers()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    w = opt.selectionner("Variance minimale", cov, esp, 20, 15.0)
+    sous = cov.loc[w.index, w.index]
+    reference = opt.mesures(w, sous, esp)["volatilite"]
+    for methode in ("Parité de risque", "Équipondéré"):
+        autre = opt.allouer(methode, sous, esp.reindex(w.index), 15.0)
+        assert opt.mesures(autre, sous, esp)["volatilite"] >= reference - 1e-6
+
+
+def test_retrecissement_rapproche_de_la_cible():
+    """Une intensité de 1 doit donner exactement la corrélation constante."""
+    r = _univers(n_act=6, n_obs=400)
+    pleine = opt.covariance_retrecie(r, intensite=1.0)
+    ecarts = np.sqrt(np.diag(pleine.to_numpy()))
+    correlations = pleine.to_numpy() / np.outer(ecarts, ecarts)
+    hors = correlations[~np.eye(len(ecarts), dtype=bool)]
+    assert proche(hors.std(), 0.0, 1e-9)       # toutes identiques
+    # Les volatilités individuelles sont préservées par la cible
+    brute = r.cov(ddof=1) * opt.JOURS_BOURSE
+    for i, t in enumerate(pleine.index):
+        assert proche(pleine.at[t, t], brute.at[t, t], 1e-9)
+
+
+def test_frontiere_est_croissante():
+    r = _univers()
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    f = opt.frontiere(cov, esp, points=12, plafond=15.0)
+    assert len(f) == 12
+    assert bool(f["Volatilité (%)"].is_monotonic_increasing)
+    assert bool(f["Rendement (%)"].is_monotonic_increasing)
+
+
+def test_univers_plus_petit_que_la_cible():
+    """Demander vingt lignes sur dix actifs ne doit pas boucler."""
+    r = _univers(n_act=10, n_obs=400)
+    cov, esp = opt.covariance_retrecie(r), opt.rendements_annualises(r)
+    w = opt.selectionner("Variance minimale", cov, esp, 20, 100.0)
+    assert len(w) == 10
+    assert proche(w.sum(), 1.0, 1e-6)
+
+
 if __name__ == "__main__":
     import sys
     import traceback
@@ -643,3 +768,5 @@ if __name__ == "__main__":
     for nom, raison in echecs:
         print(f"  - {nom} : {raison}")
     sys.exit(1 if echecs else 0)
+
+

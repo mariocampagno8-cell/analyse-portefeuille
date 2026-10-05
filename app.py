@@ -37,6 +37,7 @@ import google_prive as gpv
 import analyse as ia
 import mouvements as mo
 import niveaux as nvx
+import optimal as opt
 import performance as pfm
 
 # Streamlit reexecute app.py a chaque interaction mais conserve les modules
@@ -1235,6 +1236,236 @@ if not mvts.empty:
             "d'historique de change par ligne : sur un portefeuille "
             "majoritairement en dollar, les valeurs passées peuvent être "
             "décalées de quelques pour cent.")
+
+
+# ==========================================================================
+# Portefeuille optimal
+# ==========================================================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def charger_surveillance(url: str) -> list[str]:
+    """Tickers de l'onglet de surveillance, par compte de service."""
+    try:
+        brut = gpv.lire(st, url, onglet=rg.ONGLET_SURVEILLANCE)
+    except Exception:
+        return []
+    for colonne in brut.columns:
+        if fe._sans_accents(str(colonne)) in ("ticker", "symbole", "valeur",
+                                              "code"):
+            serie = brut[colonne]
+            break
+    else:
+        serie = brut.iloc[:, 0] if len(brut.columns) else pd.Series(dtype=str)
+    vus, sortie = set(), []
+    for t in serie:
+        t = str(t).strip().upper()
+        if t and t not in ("NAN", "TICKER") and t not in vus:
+            vus.add(t)
+            sortie.append(t)
+    return sortie
+
+
+st.divider()
+st.subheader("Portefeuille optimal")
+
+st.caption(
+    "Construit sur ta liste de surveillance, indépendamment de ce que tu "
+    "détiens. Ces allocations sont calculées sur le passé, donc en "
+    "connaissant son résultat : lis-les comme des points de comparaison, "
+    "pas comme des recommandations.")
+
+univers_surv = charger_surveillance(url)
+
+if len(univers_surv) < 25:
+    st.caption(
+        f"{len(univers_surv)} valeur(s) lue(s) dans l'onglet "
+        f"« {rg.ONGLET_SURVEILLANCE} ». Il en faut au moins 25 pour en "
+        f"sélectionner 20 avec un choix réel.")
+else:
+    with st.spinner(f"Cours de {len(univers_surv)} valeurs sur trois ans…"):
+        cours_univers = charger_cours(tuple(sorted(univers_surv)),
+                                      periode="3y")
+
+    rdt_univers = (cours_univers.pct_change().dropna(how="all")
+                   if not cours_univers.empty else pd.DataFrame())
+    # Une valeur sans historique complet fausserait la covariance : on écarte
+    # les colonnes trop lacunaires plutôt que de combler les trous.
+    if not rdt_univers.empty:
+        complets = rdt_univers.columns[
+            rdt_univers.notna().sum() >= opt.PLANCHER_OBSERVATIONS]
+        rdt_univers = rdt_univers[complets].dropna()
+
+    if rdt_univers.empty or len(rdt_univers.columns) < 21:
+        st.warning(
+            f"Historique insuffisant : {len(rdt_univers.columns) if not rdt_univers.empty else 0} "
+            f"valeur(s) exploitable(s) sur {len(univers_surv)}. Vérifie les "
+            f"tickers de ta liste de surveillance sur finance.yahoo.com.",
+            icon="⚠️")
+    else:
+        ecartees = sorted(set(univers_surv) - set(rdt_univers.columns))
+        covariance = opt.covariance_retrecie(rdt_univers)
+        esperances = opt.rendements_annualises(rdt_univers)
+
+        reglages_opt = st.columns(2)
+        nombre_lignes = reglages_opt[0].slider(
+            "Nombre de lignes", 5, min(30, len(rdt_univers.columns)), 20, 1,
+            key="opt_nombre")
+        plafond_opt = reglages_opt[1].slider(
+            "Poids maximal d'une ligne (%)", 5.0, 40.0, opt.PLAFOND_LIGNE,
+            2.5, key="opt_plafond",
+            help="Sans plafond, la variance minimale concentre sur deux ou "
+                 "trois valeurs peu volatiles.")
+
+        with st.spinner("Optimisation…"):
+            allocations, resume = {}, []
+            for methode in opt.METHODES:
+                poids = opt.selectionner(methode, covariance, esperances,
+                                         nombre_lignes, plafond_opt)
+                allocations[methode] = poids
+                sous_cov = covariance.loc[poids.index, poids.index]
+                m = opt.mesures(poids, sous_cov, esperances)
+                resume.append({
+                    "Méthode": methode,
+                    "Volatilité (%)": m["volatilite"],
+                    "Rendement passé (%)": m["rendement"],
+                    "Rendement / risque": m["sharpe"],
+                    "Lignes effectives": m["lignes_effectives"],
+                    "Poids max (%)": m["poids_max"],
+                    "Sans prévision": methode in opt.SANS_ESPERANCES})
+
+        table_resume = pd.DataFrame(resume).set_index("Méthode")
+        st.dataframe(
+            table_resume.round(2), use_container_width=True,
+            column_config={
+                "Volatilité (%)": st.column_config.NumberColumn(
+                    format="%.1f %%",
+                    help="Annualisée, calculée sur la covariance retrécie."),
+                "Rendement passé (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%",
+                    help="Rendement qu'aurait eu cette allocation sur les "
+                         "trois dernières années. Ce n'est pas une "
+                         "prévision."),
+                "Rendement / risque": st.column_config.NumberColumn(
+                    format="%.2f"),
+                "Lignes effectives": st.column_config.NumberColumn(
+                    format="%.1f",
+                    help="Inverse de l'indice de Herfindahl. Vingt lignes "
+                         "dont une pèse la moitié n'en valent que trois ou "
+                         "quatre."),
+                "Sans prévision": st.column_config.CheckboxColumn(
+                    help="Cochée : l'allocation ne dépend d'aucune estimation "
+                         "de rendement futur. Ce sont les plus solides hors "
+                         "échantillon."),
+            })
+
+        st.info(
+            "**« Variance minimum » et « rendement maximum » sont deux "
+            "objectifs opposés, pas un seul portefeuille.** Le tableau "
+            "ci-dessus montre le compromis : la variance minimale paie sa "
+            "stabilité par un rendement plus faible, le Sharpe maximal "
+            "affiche le meilleur rapport — mais sur le passé, puisqu'il "
+            "choisit précisément ce qui a déjà monté. Les deux méthodes "
+            "cochées « sans prévision » ne reposent que sur la covariance, "
+            "nettement plus stable dans le temps que les rendements.", icon="⚖️")
+
+        # --- Frontière des compromis
+        with st.spinner("Frontière…"):
+            courbe = opt.frontiere(covariance, esperances, 20, plafond_opt)
+
+        if not courbe.empty:
+            import plotly.graph_objects as go
+            sombre_opt = st.session_state.get("_sombre", True)
+            encre = "#c3c2b7" if sombre_opt else "#52514e"
+            trait = "#3987e5" if sombre_opt else "#2a78d6"
+            grille = ("rgba(255,255,255,0.07)" if sombre_opt
+                      else "rgba(0,0,0,0.07)")
+
+            fig_opt = go.Figure()
+            fig_opt.add_trace(go.Scatter(
+                x=courbe["Volatilité (%)"], y=courbe["Rendement (%)"],
+                mode="lines", name="Frontière",
+                line=dict(color=trait, width=2), showlegend=False,
+                hovertemplate="Volatilité %{x:.1f} %<br>"
+                              "Rendement %{y:+.1f} %<extra></extra>"))
+            # Les quatre méthodes partagent une couleur : leur identité est
+            # portée par l'étiquette, jamais par la teinte seule.
+            fig_opt.add_trace(go.Scatter(
+                x=table_resume["Volatilité (%)"],
+                y=table_resume["Rendement passé (%)"],
+                mode="markers+text", text=list(table_resume.index),
+                textposition="top center", name="Méthodes",
+                marker=dict(color=encre, size=10,
+                            line=dict(color=grille, width=2)),
+                textfont=dict(color=encre, size=11), showlegend=False,
+                hovertemplate="%{text}<br>Volatilité %{x:.1f} %<br>"
+                              "Rendement %{y:+.1f} %<extra></extra>"))
+            fig_opt.update_layout(
+                height=360, separators=", ",
+                margin=dict(l=0, r=10, t=30, b=0),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color=encre),
+                xaxis=dict(title="Volatilité annualisée (%)", showgrid=False,
+                           showline=False, ticks=""),
+                yaxis=dict(title="Rendement passé (%)", gridcolor=grille,
+                           zeroline=False, showline=False, ticks=""))
+            st.plotly_chart(fig_opt, use_container_width=True,
+                            config={"displayModeBar": False})
+            st.caption(
+                "Chaque point de la courbe est optimal pour un niveau de "
+                "risque donné. Choisir lequel n'est pas un calcul : c'est "
+                "une décision sur ce que tu acceptes de perdre.")
+
+        # --- Composition
+        choix_methode = st.selectbox(
+            "Composition détaillée", list(opt.METHODES),
+            key="opt_methode")
+        poids_choisi = allocations[choix_methode].sort_values(ascending=False)
+        detail_opt = pd.DataFrame({
+            "Poids (%)": poids_choisi * 100,
+            "Volatilité seule (%)": np.sqrt(np.diag(
+                covariance.loc[poids_choisi.index,
+                               poids_choisi.index].to_numpy())) * 100,
+            "Rendement passé (%)": esperances.reindex(poids_choisi.index) * 100,
+        })
+        detail_opt.index.name = "Ticker"
+        st.dataframe(
+            detail_opt.round(2), use_container_width=True,
+            column_config={
+                "Poids (%)": st.column_config.ProgressColumn(
+                    format="%.2f %%", min_value=0,
+                    max_value=float(detail_opt["Poids (%)"].max())),
+                "Rendement passé (%)": st.column_config.NumberColumn(
+                    format="%+.1f %%"),
+            })
+
+        ecartes_du_portefeuille = sorted(
+            set(detenues.index) - set(poids_choisi.index))
+        if ecartes_du_portefeuille:
+            st.caption(
+                f"Valeurs que tu détiens et que cette allocation ne retient "
+                f"pas : {', '.join(ecartes_du_portefeuille)}. Elles peuvent "
+                f"être absentes de ta liste de surveillance, ou écartées par "
+                f"l'optimisation.")
+        if ecartees:
+            st.caption(
+                f"Écartées faute d'historique suffisant : "
+                f"{', '.join(ecartees)}.")
+
+        ia.bloc(
+            titre=f"Allocation {choix_methode.lower()} sur {nombre_lignes} lignes",
+            donnees=table_resume.round(2),
+            contexte=(
+                f"Univers de {len(rdt_univers.columns)} valeurs surveillées, "
+                f"trois ans d'historique quotidien, covariance retrécie de "
+                f"{opt.RETRECISSEMENT:.0%} vers une cible à corrélation "
+                f"constante. Plafond de {plafond_opt:.0f} % par ligne, "
+                f"plancher de {opt.PLANCHER_LIGNE:.0f} %. Le portefeuille "
+                f"réel de l'utilisateur compte {len(detenues)} lignes dont "
+                f"la plus lourde pèse "
+                f"{float(detenues['Valeur'].max()) / total * 100:.0f} %."
+                if total > 0 else ""),
+            cle_widget="optimisation",
+            consignes=ia.CONSIGNES_PORTEFEUILLE)
 
 
 # --- Positions soldées
